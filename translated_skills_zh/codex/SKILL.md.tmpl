@@ -1,0 +1,357 @@
+---
+name: codex
+version: 1.0.0
+description: |
+  OpenAI Codex CLI 包装器，包含三种模式。代码审查：通过
+  `codex review` 进行独立 diff 审查，并带有通过/失败门禁。挑战：试图破坏
+  你的代码的对抗模式。咨询：通过会话连续性向 codex 询问任何问题，以便后续追问。
+  那个“200 IQ autistic developer”式的第二意见。当被要求执行“codex review”、
+  “codex challenge”、“ask codex”、“second opinion”或“consult codex”时使用。
+allowed-tools:
+  - Bash
+  - Read
+  - Write
+  - Glob
+  - Grep
+  - AskUserQuestion
+---
+
+{{PREAMBLE}}
+
+{{BASE_BRANCH_DETECT}}
+
+# /codex — 多 AI 第二意见
+
+你正在运行 `/codex` 技能。它包装了 OpenAI Codex CLI，以便从另一个 AI 系统获得独立、
+毫不留情的诚实第二意见。
+
+Codex 是“200 IQ autistic developer”风格的存在，直接、简练、技术上精确，会质疑
+假设，能发现你可能遗漏的问题。请如实呈现它的输出，不要总结。
+
+---
+
+## 步骤 0：检查 codex 二进制文件
+
+```bash
+CODEX_BIN=$(which codex 2>/dev/null || echo "")
+[ -z "$CODEX_BIN" ] && echo "NOT_FOUND" || echo "FOUND: $CODEX_BIN"
+```
+
+如果是 `NOT_FOUND`：停止并告诉用户：
+“未找到 Codex CLI。请安装：`npm install -g @openai/codex`，或参见 https://github.com/openai/codex”
+
+---
+
+## 步骤 1：检测模式
+
+解析用户输入，以确定要运行哪种模式：
+
+1. `/codex review` 或 `/codex review <instructions>` — **审查模式**（步骤 2A）
+2. `/codex challenge` 或 `/codex challenge <focus>` — **挑战模式**（步骤 2B）
+3. 不带参数的 `/codex` — **自动检测：**
+   - 检查是否存在 diff（如果 origin 不可用则回退）：
+     `git diff origin/<base> --stat 2>/dev/null | tail -1 || git diff <base> --stat 2>/dev/null | tail -1`
+   - 如果存在 diff，使用 AskUserQuestion：
+     ```
+     Codex 检测到相对于基础分支存在变更。它应该执行什么操作？
+     A) 审查 diff（带通过/失败门禁的代码审查）
+     B) 挑战 diff（对抗式，尝试破坏它）
+     C) 其他事情 — 我会提供一个提示词
+     ```
+   - 如果没有 diff，检查限定在当前项目范围内的计划文件：
+     `ls -t ~/.claude/plans/*.md 2>/dev/null | xargs grep -l "$(basename $(pwd))" 2>/dev/null | head -1`
+     如果没有匹配当前项目范围的文件，则回退到：`ls -t ~/.claude/plans/*.md 2>/dev/null | head -1`
+     但要警告用户：“注意：这个计划可能来自其他项目。”
+   - 如果存在计划文件，提供审查它的选项
+   - 否则，询问：“你想向 Codex 询问什么？”
+4. `/codex <anything else>` — **咨询模式**（步骤 2C），其中剩余文本就是提示词
+
+---
+
+## 步骤 2A：审查模式
+
+针对当前分支的 diff 运行 Codex 代码审查。
+
+1. 创建用于捕获输出的临时文件：
+```bash
+TMPERR=$(mktemp /tmp/codex-err-XXXXXX.txt)
+```
+
+2. 运行审查（5 分钟超时）：
+```bash
+codex review --base <base> -c 'model_reasoning_effort="xhigh"' --enable web_search_cached 2>"$TMPERR"
+```
+
+在 Bash 调用中使用 `timeout: 300000`。如果用户提供了自定义说明
+（例如 `/codex review focus on security`），将其作为 prompt 参数传入：
+```bash
+codex review "focus on security" --base <base> -c 'model_reasoning_effort="xhigh"' --enable web_search_cached 2>"$TMPERR"
+```
+
+3. 捕获输出。然后从 stderr 解析成本：
+```bash
+grep "tokens used" "$TMPERR" 2>/dev/null || echo "tokens: unknown"
+```
+
+4. 通过检查审查输出中的严重发现来确定门禁结论。
+   如果输出包含 `[P1]`，门禁结果为 **FAIL**。
+   如果未发现 `[P1]` 标记（只有 `[P2]` 或没有发现），门禁结果为 **PASS**。
+
+5. 呈现输出：
+
+```
+CODEX SAYS (代码审查):
+════════════════════════════════════════════════════════════
+<完整 codex 输出，逐字保留，不要截断或总结>
+════════════════════════════════════════════════════════════
+GATE: PASS                    Tokens: 14,331 | Est. cost: ~$0.12
+```
+
+或
+
+```
+GATE: FAIL (N 个严重发现)
+```
+
+6. **跨模型比较：** 如果在本次对话更早之前已经运行过 `/review`
+   （Claude 自己的审查），比较两组发现：
+
+```
+CROSS-MODEL ANALYSIS:
+  两者都发现了：[Claude 和 Codex 重叠的发现]
+  仅 Codex 发现：[Codex 独有的发现]
+  仅 Claude 发现：[Claude 的 /review 独有的发现]
+  一致率：X%（N/M 个唯一发现中有重叠）
+```
+
+7. 持久化保存审查结果：
+```bash
+~/.claude/skills/gstack/bin/gstack-review-log '{"skill":"codex-review","timestamp":"TIMESTAMP","status":"STATUS","gate":"GATE","findings":N,"findings_fixed":N}'
+```
+
+替换为：TIMESTAMP（ISO 8601）、STATUS（如果是 PASS 则为 `"clean"`，
+如果是 FAIL 则为 `"issues_found"`）、GATE（`"pass"` 或 `"fail"`），
+findings（`[P1]` + `[P2]` 标记的数量），
+findings_fixed（发布前已处理/修复的发现数量）。
+
+8. 清理临时文件：
+```bash
+rm -f "$TMPERR"
+```
+
+{{PLAN_FILE_REVIEW_REPORT}}
+
+---
+
+## 步骤 2B：挑战（对抗）模式
+
+Codex 会尝试破坏你的代码，寻找边界情况、竞争条件、安全漏洞，
+以及普通审查可能遗漏的失效模式。
+
+1. 构造对抗式提示词。如果用户提供了关注领域
+（例如 `/codex challenge security`），请包含进去：
+
+默认提示词（无关注点）：
+“审查此分支相对于基础分支的变更。运行 `git diff origin/<base>` 查看 diff。你的任务是找出这段代码在生产环境中会如何失败。像攻击者和混沌工程师一样思考。找出边界情况、竞争条件、安全漏洞、资源泄漏、失效模式以及静默数据损坏路径。保持对抗性。彻底检查。不需要称赞，只要问题。”
+
+带关注点的提示词（例如 `"security"`）：
+“审查此分支相对于基础分支的变更。运行 `git diff origin/<base>` 查看 diff。重点关注 SECURITY。你的任务是找出攻击者可能利用这段代码的所有方式。思考注入向量、auth bypass、privilege escalation、数据暴露以及时序攻击。保持对抗性。”
+
+2. 使用 **JSONL output** 运行 codex exec，以捕获推理轨迹和工具调用（5 分钟超时）：
+```bash
+codex exec "<prompt>" -s read-only -c 'model_reasoning_effort="xhigh"' --enable web_search_cached --json 2>/dev/null | python3 -c "
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        obj = json.loads(line)
+        t = obj.get('type','')
+        if t == 'item.completed' and 'item' in obj:
+            item = obj['item']
+            itype = item.get('type','')
+            text = item.get('text','')
+            if itype == 'reasoning' and text:
+                print(f'[codex thinking] {text}')
+                print()
+            elif itype == 'agent_message' and text:
+                print(text)
+            elif itype == 'command_execution':
+                cmd = item.get('command','')
+                if cmd: print(f'[codex ran] {cmd}')
+        elif t == 'turn.completed':
+            usage = obj.get('usage',{})
+            tokens = usage.get('input_tokens',0) + usage.get('output_tokens',0)
+            if tokens: print(f'\ntokens used: {tokens}')
+    except: pass
+"
+```
+
+这会解析 codex 的 JSONL 事件，以提取推理轨迹、工具调用和最终响应。
+`[codex thinking]` 行会显示 codex 在给出答案前的推理内容。
+
+3. 呈现完整的流式输出：
+
+```
+CODEX SAYS (对抗挑战):
+════════════════════════════════════════════════════════════
+<上述完整输出，逐字保留>
+════════════════════════════════════════════════════════════
+Tokens: N | Est. cost: ~$X.XX
+```
+
+---
+
+## 步骤 2C：咨询模式
+
+向 Codex 询问任何与代码库有关的问题。支持会话连续性，以便后续追问。
+
+1. **检查现有会话：**
+```bash
+cat .context/codex-session-id 2>/dev/null || echo "NO_SESSION"
+```
+
+如果存在会话文件（不是 `NO_SESSION`），使用 AskUserQuestion：
+```
+你有一个之前的活跃 Codex 对话。继续它，还是重新开始？
+A) 继续对话（Codex 会记住之前的上下文）
+B) 开始新对话
+```
+
+2. 创建临时文件：
+```bash
+TMPRESP=$(mktemp /tmp/codex-resp-XXXXXX.txt)
+TMPERR=$(mktemp /tmp/codex-err-XXXXXX.txt)
+```
+
+3. **计划审查自动检测：** 如果用户的提示词与审查计划有关，
+或者存在计划文件且用户输入的是不带参数的 `/codex`：
+```bash
+ls -t ~/.claude/plans/*.md 2>/dev/null | xargs grep -l "$(basename $(pwd))" 2>/dev/null | head -1
+```
+如果没有匹配当前项目范围的文件，则回退到 `ls -t ~/.claude/plans/*.md 2>/dev/null | head -1`
+但要警告：“注意：这个计划可能来自其他项目，在发送给 Codex 之前请先核实。”
+读取计划文件，并将角色说明预置到用户提示词前面：
+“你是一名毫不留情的技术审查者。请从以下方面审查这个计划：逻辑缺口和
+未说明的假设、缺失的错误处理或边界情况、过度复杂（是否存在更简单的
+方法？）、可行性风险（哪里可能出错？），以及缺失的依赖关系
+或时序问题。直接一点。简练一点。不需要称赞。只说问题。
+
+THE PLAN:
+<plan content>”
+
+4. 使用 **JSONL output** 运行 codex exec，以捕获推理轨迹（5 分钟超时）：
+
+对于**新会话：**
+```bash
+codex exec "<prompt>" -s read-only -c 'model_reasoning_effort="xhigh"' --enable web_search_cached --json 2>"$TMPERR" | python3 -c "
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        obj = json.loads(line)
+        t = obj.get('type','')
+        if t == 'thread.started':
+            tid = obj.get('thread_id','')
+            if tid: print(f'SESSION_ID:{tid}')
+        elif t == 'item.completed' and 'item' in obj:
+            item = obj['item']
+            itype = item.get('type','')
+            text = item.get('text','')
+            if itype == 'reasoning' and text:
+                print(f'[codex thinking] {text}')
+                print()
+            elif itype == 'agent_message' and text:
+                print(text)
+            elif itype == 'command_execution':
+                cmd = item.get('command','')
+                if cmd: print(f'[codex ran] {cmd}')
+        elif t == 'turn.completed':
+            usage = obj.get('usage',{})
+            tokens = usage.get('input_tokens',0) + usage.get('output_tokens',0)
+            if tokens: print(f'\ntokens used: {tokens}')
+    except: pass
+"
+```
+
+对于**恢复的会话**（用户选择“Continue”）：
+```bash
+codex exec resume <session-id> "<prompt>" -s read-only -c 'model_reasoning_effort="xhigh"' --enable web_search_cached --json 2>"$TMPERR" | python3 -c "
+<与上面相同的 python 流式解析器>
+"
+```
+
+5. 从流式输出中捕获 session ID。解析器会从 `thread.started` 事件中打印 `SESSION_ID:<id>`。
+   将它保存起来，以便后续追问：
+```bash
+mkdir -p .context
+```
+将解析器打印出的 session ID（以 `SESSION_ID:` 开头的那一行）
+保存到 `.context/codex-session-id`。
+
+6. 呈现完整的流式输出：
+
+```
+CODEX SAYS (咨询):
+════════════════════════════════════════════════════════════
+<完整输出，逐字保留，包含 [codex thinking] 轨迹>
+════════════════════════════════════════════════════════════
+Tokens: N | Est. cost: ~$X.XX
+Session saved — 再次运行 /codex 以继续此对话。
+```
+
+7. 在呈现之后，指出 Codex 的分析与您自身理解不同的任何地方。
+   如果存在分歧，标记出来：
+   “注意：Claude Code 在 X 上不同意，因为 Y。”
+
+---
+
+## 模型与推理
+
+**Model：** 未硬编码任何模型，codex 会使用它当前的默认模型（前沿
+agentic coding model）。这意味着随着 OpenAI 发布更新的模型，`/codex` 会自动
+使用它们。如果用户想指定某个模型，请将 `-m` 传递给 codex。
+
+**Reasoning effort：** 所有模式都使用 `xhigh`，即最大推理能力。在审查代码、破坏代码或咨询架构问题时，你会希望模型尽可能深入地思考。
+
+**Web search：** 所有 codex 命令都使用 `--enable web_search_cached`，这样 Codex 就可以在审查期间查阅
+文档和 API。这是 OpenAI 的缓存索引，速度快，没有额外成本。
+
+如果用户指定了模型（例如 `/codex review -m gpt-5.1-codex-max`
+或 `/codex challenge -m gpt-5.2`），将 `-m` flag 传递给 codex。
+
+---
+
+## 成本估算
+
+从 stderr 解析 token 数。Codex 会向 stderr 打印 `tokens used\nN`。
+
+显示为：`Tokens: N`
+
+如果无法获取 token 数，则显示：`Tokens: unknown`
+
+---
+
+## 错误处理
+
+- **未找到二进制文件：** 在步骤 0 中检测。停止并提供安装说明。
+- **认证错误：** Codex 会将认证错误打印到 stderr。直接展示该错误：
+  “Codex 认证失败。请在终端中运行 `codex login` 以通过 ChatGPT 完成认证。”
+- **超时：** 如果 Bash 调用超时（5 分钟），告诉用户：
+  “Codex 在 5 分钟后超时。diff 可能过大，或者 API 可能较慢。请重试，或缩小范围。”
+- **空响应：** 如果 `$TMPRESP` 为空或不存在，告诉用户：
+  “Codex 没有返回响应。请检查 stderr 中的错误。”
+- **会话恢复失败：** 如果恢复失败，删除会话文件并重新开始。
+
+---
+
+## 重要规则
+
+- **绝不要修改文件。** 这个技能是只读的。Codex 在只读沙箱模式下运行。
+- **逐字呈现输出。** 在展示 Codex 输出之前，不要截断、总结或加入个人评述。
+  要在 CODEX SAYS 块中完整展示。
+- **先展示完整输出，再补充综合判断。** 任何 Claude 的评论都必须出现在完整输出之后。
+- **所有对 codex 的 Bash 调用都使用 5 分钟超时**（`timeout: 300000`）。
+- **不要重复审查。** 如果用户已经运行过 `/review`，Codex 提供的是第二个
+  独立意见。不要再次运行 Claude Code 自己的审查。

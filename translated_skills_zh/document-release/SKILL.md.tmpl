@@ -1,0 +1,354 @@
+---
+name: document-release
+version: 1.0.0
+description: |
+  发布后文档更新。读取所有项目文档，交叉比对
+  diff，更新 README/ARCHITECTURE/CONTRIBUTING/CLAUDE.md 以匹配已发布内容，
+  润色 CHANGELOG 的表述风格，清理 TODOS，并可选地提升 VERSION。适用于
+  被要求“更新文档”、“同步文档”或“发布后文档”时。
+  在 PR 合并后或代码发布后主动建议使用。
+allowed-tools:
+  - Bash
+  - Read
+  - Write
+  - Edit
+  - Grep
+  - Glob
+  - AskUserQuestion
+---
+
+{{PREAMBLE}}
+
+{{BASE_BRANCH_DETECT}}
+
+# 文档发布：发布后文档更新
+
+你正在运行 `/document-release` 工作流。它在 **`/ship` 之后**（代码已提交，PR
+已存在或即将存在）但在 **PR 合并之前** 运行。你的任务：确保项目中的每个文档文件
+都准确、最新，并以友好、面向用户的语气撰写。
+
+你主要是自动执行。明显的事实性更新直接处理。只在高风险或主观决策时停止并提问。
+
+**只在以下情况停止：**
+- 有风险/存疑的文档变更（叙述、理念、安全性、删除内容、大规模重写）
+- VERSION 提升决策（如果尚未提升）
+- 需要新增的 TODOS 条目
+- 跨文档的叙述性矛盾（不是事实性矛盾）
+
+**以下情况绝不停止：**
+- 从 diff 中可以明确得出的事实性修正
+- 向表格/列表中添加条目
+- 更新路径、数量、版本号
+- 修复过期的交叉引用
+- CHANGELOG 表述风格润色（小幅措辞调整）
+- 将 TODOS 标记为已完成
+- 跨文档的事实性不一致（例如版本号不匹配）
+
+**绝对不要做：**
+- 覆盖、替换或重新生成 CHANGELOG 条目，只能润色措辞，必须保留全部内容
+- 未经询问提升 VERSION，版本变更必须始终使用 AskUserQuestion
+- 对 CHANGELOG.md 使用 `Write` 工具，必须始终使用带精确 `old_string` 匹配的 `Edit`
+
+---
+
+## 第 1 步：预检与 Diff 分析
+
+1. 检查当前分支。如果在基础分支上，**中止**："你当前位于基础分支。请在功能分支上运行。"
+
+2. 收集变更上下文：
+
+```bash
+git diff <base>...HEAD --stat
+```
+
+```bash
+git log <base>..HEAD --oneline
+```
+
+```bash
+git diff <base>...HEAD --name-only
+```
+
+3. 发现仓库中的所有文档文件：
+
+```bash
+find . -maxdepth 2 -name "*.md" -not -path "./.git/*" -not -path "./node_modules/*" -not -path "./.gstack/*" -not -path "./.context/*" | sort
+```
+
+4. 将变更分类为与文档相关的类别：
+   - **新功能** — 新文件、新命令、新技能、新能力
+   - **行为变更** — 修改过的服务、更新后的 API、配置变更
+   - **移除的功能** — 已删除文件、已移除命令
+   - **基础设施** — 构建系统、测试基础设施、CI
+
+5. 输出简要摘要："正在分析 M 次提交中的 N 个变更文件。发现 K 个需要审查的文档文件。"
+
+---
+
+## 第 2 步：逐文件文档审计
+
+读取每个文档文件，并与 diff 交叉比对。使用以下通用启发式规则
+（根据你所在的项目进行调整，这些并非 gstack 专用）：
+
+**README.md：**
+- 它是否描述了 diff 中可见的所有功能与能力？
+- 安装/设置说明是否与这些变更保持一致？
+- 示例、演示和用法描述是否仍然有效？
+- 故障排查步骤是否仍然准确？
+
+**ARCHITECTURE.md：**
+- ASCII 图和组件描述是否与当前代码一致？
+- 设计决策和“为什么”的说明是否仍然准确？
+- 保持保守，只有在 diff 明确反驳的情况下才更新。架构文档
+  描述的内容通常不太会频繁变化。
+
+**CONTRIBUTING.md — 新贡献者冒烟测试：**
+- 像一个全新的贡献者一样走一遍设置说明。
+- 列出的命令是否准确？每一步都能成功吗？
+- 测试层级说明是否与当前测试基础设施一致？
+- 工作流说明（开发设置、贡献者模式等）是否为最新？
+- 标记任何会让首次贡献者失败或困惑的内容。
+
+**CLAUDE.md / 项目说明：**
+- 项目结构部分是否与实际文件树一致？
+- 列出的命令和脚本是否准确？
+- 构建/测试说明是否与 package.json（或同类文件）中的内容一致？
+
+**任何其他 .md 文件：**
+- 读取文件，判断它的用途和目标读者。
+- 与 diff 交叉比对，检查它是否与文件中的任何表述相矛盾。
+
+对每个文件，将所需更新分类为：
+
+- **Auto-update** — 由 diff 明确支持的事实性修正：向
+  表格中添加条目、更新文件路径、修正数量、更新项目结构树。
+- **Ask user** — 叙述性变更、删除章节、安全模型变更、大规模重写
+  （单个章节超过约 10 行）、相关性不明确、添加全新章节。
+
+---
+
+## 第 3 步：应用自动更新
+
+使用 Edit 工具直接进行所有明确的事实性更新。
+
+对每个被修改的文件，输出一行摘要，说明 **具体改了什么**，而不是
+只写“已更新 README.md”，而应写“README.md：向技能表添加了 /new-skill，将技能数量
+从 9 更新为 10。”
+
+**绝不自动更新：**
+- README 引言或项目定位
+- ARCHITECTURE 的理念或设计依据
+- 安全模型描述
+- 不要从任何文档中移除整个章节
+
+---
+
+## 第 4 步：询问高风险/存疑变更
+
+对第 2 步中识别出的每个高风险或存疑更新，使用 AskUserQuestion，并提供：
+- 上下文：项目名称、分支、涉及的文档文件、当前审查内容
+- 具体的文档决策
+- `RECOMMENDATION: Choose [X] because [单行原因]`
+- 选项中包含 C) Skip — 保持原样
+
+每次收到答案后立即应用已批准的变更。
+
+---
+
+## 第 5 步：CHANGELOG 表述风格润色
+
+**关键：绝不要破坏 CHANGELOG 条目。**
+
+此步骤用于润色表述风格。它**不会**重写、替换或重新生成 CHANGELOG 内容。
+
+曾发生过一次真实事故：某个代理替换了现有 CHANGELOG 条目，而它本应
+保留这些内容。此技能**绝对不能**这样做。
+
+**规则：**
+1. 先完整读取 CHANGELOG.md。理解其中已有内容。
+2. 只修改现有条目内部的措辞。绝不能删除、重排或替换条目。
+3. 绝不能从头重新生成 CHANGELOG 条目。条目由 `/ship` 根据
+   实际 diff 和提交历史写入。它是真实来源。你是在润色表述，而不是
+   重写历史。
+4. 如果某条目看起来有误或不完整，使用 AskUserQuestion，不要静默修复。
+5. 使用带精确 `old_string` 匹配的 Edit 工具，绝不能使用 Write 覆盖 CHANGELOG.md。
+
+**如果该分支未修改 CHANGELOG：** 跳过此步骤。
+
+**如果该分支修改了 CHANGELOG**，从表述风格角度审查条目：
+
+- **销售测试：** 用户在阅读每个条目时，是否会觉得“哦，这不错，我想试试”？如果不会，
+  就重写措辞（不是内容）。
+- 先写用户现在可以 **做什么**，而不是实现细节。
+- 用“你现在可以……”而不是“重构了……”
+- 标记并重写任何读起来像提交信息的条目。
+- 内部/贡献者相关变更应放入单独的 “### For contributors” 小节。
+- 对轻微的表述调整直接自动修复。如果重写会改变含义，使用 AskUserQuestion。
+
+---
+
+## 第 6 步：跨文档一致性与可发现性检查
+
+在逐个审计每个文件之后，进行一次跨文档一致性检查：
+
+1. README 的功能/能力列表是否与 CLAUDE.md（或项目说明）中的描述一致？
+2. ARCHITECTURE 的组件列表是否与 CONTRIBUTING 的项目结构描述一致？
+3. CHANGELOG 的最新版本是否与 VERSION 文件一致？
+4. **可发现性：** 每个文档文件是否都能从 README.md 或 CLAUDE.md 到达？如果
+   存在 ARCHITECTURE.md，但 README 和 CLAUDE.md 都没有链接到它，就要标记。每个文档
+   都应能从这两个入口文件之一被发现。
+5. 标记文档之间的任何矛盾。对明显的事实性不一致自动修复（例如
+   版本不匹配）。对叙述性矛盾使用 AskUserQuestion。
+
+---
+
+## 第 7 步：TODOS.md 清理
+
+这是对 `/ship` 第 5.5 步的第二轮补充检查。读取 `review/TODOS-format.md`（如果
+存在），以获取规范的 TODO 条目格式。
+
+如果不存在 TODOS.md，则跳过此步骤。
+
+1. **已完成但尚未标记的条目：** 将 diff 与未完成的 TODO 条目交叉比对。如果某个
+   TODO 明显已由当前分支中的变更完成，则将其移动到 Completed 部分，
+   并标记为 `**Completed:** vX.Y.Z.W (YYYY-MM-DD)`。保持保守，只有在 diff 中有明确
+   证据时才标记完成。
+
+2. **需要更新描述的条目：** 如果某个 TODO 引用了已被
+   大幅修改的文件或组件，它的描述可能已经过时。使用 AskUserQuestion 确认
+   该 TODO 应被更新、标记完成，还是保持不变。
+
+3. **新的延后工作：** 检查 diff 中的 `TODO`、`FIXME`、`HACK` 和 `XXX` 注释。对
+   每一个代表有意义的延后工作（而不是琐碎的内联备注）的项，使用
+   AskUserQuestion 询问是否应将其记录到 TODOS.md 中。
+
+---
+
+## 第 8 步：VERSION 提升提问
+
+**关键：绝不要在未询问的情况下提升 VERSION。**
+
+1. **如果 VERSION 不存在：** 静默跳过。
+
+2. 检查此分支上是否已经修改过 VERSION：
+
+```bash
+git diff <base>...HEAD -- VERSION
+```
+
+3. **如果 VERSION 尚未提升：** 使用 AskUserQuestion：
+   - RECOMMENDATION: Choose C (Skip) because docs-only changes rarely warrant a version bump
+   - A) 提升 PATCH (X.Y.Z+1) — 如果文档变更与代码变更一同发布
+   - B) 提升 MINOR (X.Y+1.0) — 如果这是一次重要的独立发布
+   - C) Skip — 不需要提升版本
+
+4. **如果 VERSION 已经提升：** 不要静默跳过。而是检查这次提升
+   是否仍覆盖了该分支上全部变更范围：
+
+   a. 读取当前 VERSION 对应的 CHANGELOG 条目。它描述了哪些功能？
+   b. 读取完整 diff（`git diff <base>...HEAD --stat` 和 `git diff <base>...HEAD --name-only`）。
+      是否存在当前版本 CHANGELOG 条目中**未提及**的重要变更（新功能、新技能、新命令、重大重构）？
+   c. **如果 CHANGELOG 条目覆盖了所有内容：** 跳过，输出“VERSION：已提升到
+      vX.Y.Z，覆盖了全部变更。”
+   d. **如果存在未覆盖的重要变更：** 使用 AskUserQuestion，说明
+      当前版本覆盖了什么，而新增了什么，并提问：
+      - RECOMMENDATION: Choose A because the new changes warrant their own version
+      - A) 提升到下一个 patch (X.Y.Z+1) — 为新变更提供独立版本
+      - B) 保持当前版本 — 将新变更添加到现有 CHANGELOG 条目中
+      - C) Skip — 保持当前版本不变，稍后处理
+
+   关键理解：为“功能 A”设置的 VERSION 提升，不应静默吸收“功能 B”，
+   如果功能 B 足够重要，理应拥有自己的版本条目。
+
+---
+
+## 第 9 步：提交与输出
+
+**先做空检查：** 运行 `git status`（绝不要使用 `-uall`）。如果前面任何步骤都没有
+修改文档文件，则输出“所有文档均为最新。”并退出，不要提交。
+
+**提交：**
+
+1. 按文件名暂存已修改的文档文件（绝不要使用 `git add -A` 或 `git add .`）。
+2. 创建单个提交：
+
+```bash
+git commit -m "$(cat <<'EOF'
+docs: update project documentation for vX.Y.Z.W
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+EOF
+)"
+```
+
+3. 推送到当前分支：
+
+```bash
+git push
+```
+
+**PR 正文更新（幂等、竞态安全）：**
+
+1. 将现有 PR 正文读取到带 PID 唯一性的临时文件中：
+
+```bash
+gh pr view --json body -q .body > /tmp/gstack-pr-body-$$.md
+```
+
+2. 如果临时文件已包含 `## Documentation` 小节，则用
+   更新后的内容替换该小节。如果不包含，则在末尾追加一个 `## Documentation` 小节。
+
+3. Documentation 小节应包含一个 **文档 diff 预览** —— 对每个被修改的文件，
+   说明具体改了什么（例如：“README.md：向技能
+   表中添加了 /document-release，将技能数量从 9 更新为 10”）。
+
+4. 将更新后的正文写回：
+
+```bash
+gh pr edit --body-file /tmp/gstack-pr-body-$$.md
+```
+
+5. 清理临时文件：
+
+```bash
+rm -f /tmp/gstack-pr-body-$$.md
+```
+
+6. 如果 `gh pr view` 失败（不存在 PR）：跳过，并输出“未找到 PR，跳过正文更新。”
+7. 如果 `gh pr edit` 失败：警告“无法更新 PR 正文，文档变更已包含在
+   提交中。”并继续。
+
+**结构化文档健康摘要（最终输出）：**
+
+输出一个便于浏览的摘要，显示每个文档文件的状态：
+
+```
+Documentation health:
+  README.md       [status] ([details])
+  ARCHITECTURE.md [status] ([details])
+  CONTRIBUTING.md [status] ([details])
+  CHANGELOG.md    [status] ([details])
+  TODOS.md        [status] ([details])
+  VERSION         [status] ([details])
+```
+
+其中状态为以下之一：
+- Updated — 附带具体变更说明
+- Current — 无需更改
+- Voice polished — 已调整措辞
+- Not bumped — 用户选择跳过
+- Already bumped — 版本已由 /ship 设置
+- Skipped — 文件不存在
+
+---
+
+## 重要规则
+
+- **编辑前先阅读。** 修改文件前，务必先完整读取其全部内容。
+- **绝不能破坏 CHANGELOG。** 只能润色措辞。绝不能删除、替换或重新生成条目。
+- **绝不能静默提升 VERSION。** 必须始终询问。即使已经提升，也要检查它是否覆盖全部变更范围。
+- **明确说明改了什么。** 每一处编辑都要有一行摘要。
+- **使用通用启发式规则，而非项目专用规则。** 这些审计检查适用于任何仓库。
+- **可发现性很重要。** 每个文档文件都应能从 README 或 CLAUDE.md 到达。
+- **语气：友好、面向用户、不晦涩。** 写作方式应像是在向一个聪明但
+  没看过代码的人解释。

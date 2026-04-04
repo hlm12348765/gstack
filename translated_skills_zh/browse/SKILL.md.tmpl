@@ -1,0 +1,141 @@
+---
+name: browse
+version: 1.1.0
+description: |
+  用于 QA 测试和网站自测的快速无头浏览器。可导航到任意 URL，与元素交互，
+  验证页面状态，对操作前后进行差异比较，拍摄带标注的截图，检查响应式布局，
+  测试表单和上传，处理对话框，并断言元素状态。
+  每条命令约 ~100ms。在你需要测试某个功能、验证一次部署、亲自走通一段
+  用户流程，或提交带证据的缺陷时使用。也可在被要求“open in browser”、“test the
+  site”、“take a screenshot”或“dogfood this”时使用。
+allowed-tools:
+  - Bash
+  - Read
+  - AskUserQuestion
+
+---
+
+{{PREAMBLE}}
+
+# browse: QA 测试与自测
+
+持久化无头 Chromium。首次调用会自动启动（约 ~3s），之后每条命令约 ~100ms。
+状态会在调用之间持续保留（cookies、tabs、login sessions）。
+
+{{BROWSE_SETUP}}
+
+## 核心 QA 模式
+
+### 1. 验证页面是否正确加载
+```bash
+$B goto https://yourapp.com
+$B text                          # 内容是否已加载？
+$B console                       # 是否有 JS 错误？
+$B network                       # 是否有请求失败？
+$B is visible ".main-content"    # 关键元素是否存在？
+```
+
+### 2. 测试用户流程
+```bash
+$B goto https://app.com/login
+$B snapshot -i                   # 查看所有可交互元素
+$B fill @e3 "user@test.com"
+$B fill @e4 "password"
+$B click @e5                     # 提交
+$B snapshot -D                   # 差异：提交后发生了什么变化？
+$B is visible ".dashboard"       # 成功状态是否出现？
+```
+
+### 3. 验证某个操作是否生效
+```bash
+$B snapshot                      # 基线
+$B click @e3                     # 执行某个操作
+$B snapshot -D                   # 统一差异会准确显示变化内容
+```
+
+### 4. 为缺陷报告提供可视化证据
+```bash
+$B snapshot -i -a -o /tmp/annotated.png   # 带标签的截图
+$B screenshot /tmp/bug.png                # 普通截图
+$B console                                # 错误日志
+```
+
+### 5. 查找所有可点击元素（包括非 ARIA 元素）
+```bash
+$B snapshot -C                   # 查找带有 cursor:pointer、onclick、tabindex 的 div
+$B click @c1                     # 与它们交互
+```
+
+### 6. 断言元素状态
+```bash
+$B is visible ".modal"
+$B is enabled "#submit-btn"
+$B is disabled "#submit-btn"
+$B is checked "#agree-checkbox"
+$B is editable "#name-field"
+$B is focused "#search-input"
+$B js "document.body.textContent.includes('Success')"
+```
+
+### 7. 测试响应式布局
+```bash
+$B responsive /tmp/layout        # mobile + tablet + desktop 截图
+$B viewport 375x812              # 或设置特定视口
+$B screenshot /tmp/mobile.png
+```
+
+### 8. 测试文件上传
+```bash
+$B upload "#file-input" /path/to/file.pdf
+$B is visible ".upload-success"
+```
+
+### 9. 测试对话框
+```bash
+$B dialog-accept "yes"           # 先设置处理器
+$B click "#delete-button"        # 触发对话框
+$B dialog                        # 查看出现了什么
+$B snapshot -D                   # 验证删除是否已发生
+```
+
+### 10. 比较环境
+```bash
+$B diff https://staging.app.com https://prod.app.com
+```
+
+### 11. 向用户展示截图
+在执行 `$B screenshot`、`$B snapshot -a -o` 或 `$B responsive` 之后，始终对输出的 PNG 使用 Read 工具，这样用户才能看到它们。否则，截图将不可见。
+
+## 用户交接
+
+当你遇到无头模式无法处理的情况时（CAPTCHA、复杂认证、多因素
+登录），交接给用户处理：
+
+```bash
+# 1. 在当前页面打开一个可见的 Chrome
+$B handoff "卡在登录页面的 CAPTCHA"
+
+# 2. 告诉用户发生了什么（通过 AskUserQuestion）
+#    "我已经在登录页面打开了 Chrome。请完成 CAPTCHA，
+#     完成后告诉我。"
+
+# 3. 当用户说“done”后，重新 snapshot 并继续
+$B resume
+```
+
+**何时使用 handoff：**
+- CAPTCHA 或机器人检测
+- 多因素认证（短信、authenticator app）
+- 需要用户交互的 OAuth 流程
+- AI 在尝试 3 次后仍无法处理的复杂交互
+
+浏览器会在交接期间保留所有状态（cookies、localStorage、tabs）。
+执行 `resume` 后，你会获得一份全新的快照，内容是用户停止操作时所在的位置。
+
+## Snapshot 标志
+
+{{SNAPSHOT_FLAGS}}
+
+## 完整命令列表
+
+{{COMMAND_REFERENCE}}

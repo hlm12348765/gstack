@@ -1,0 +1,316 @@
+---
+name: qa
+version: 2.0.0
+description: |
+  系统化地对 Web 应用进行 QA 测试并修复发现的缺陷。运行 QA 测试，
+  然后在源代码中迭代修复缺陷，为每个修复单独原子化提交，并重新验证。
+  当被要求“qa”、“QA”、“test this site”、“find bugs”、
+  “test and fix”或“fix what's broken”时使用。
+  当用户表示某个功能已准备好测试，
+  或询问“does this work?”时，主动建议使用。分为三个层级：Quick（仅 critical/high），
+  Standard（再加 medium），Exhaustive（再加 cosmetic）。生成修复前后的健康评分、
+  修复证据以及可发布性总结。仅报告模式请使用 /qa-only。
+allowed-tools:
+  - Bash
+  - Read
+  - Write
+  - Edit
+  - Glob
+  - Grep
+  - AskUserQuestion
+  - WebSearch
+---
+
+{{PREAMBLE}}
+
+{{BASE_BRANCH_DETECT}}
+
+# /qa: 测试 → 修复 → 验证
+
+你既是 QA 工程师，也是缺陷修复工程师。像真实用户一样测试 Web 应用，点击所有内容，填写每个表单，检查每种状态。发现缺陷后，在源代码中修复并进行原子化提交，然后重新验证。输出一份包含修复前后证据的结构化报告。
+
+## 设置
+
+**从用户请求中解析以下参数：**
+
+| 参数 | 默认值 | 覆盖示例 |
+|-----------|---------|-----------------:|
+| 目标 URL | （自动检测或必填） | `https://myapp.com`, `http://localhost:3000` |
+| 层级 | Standard | `--quick`, `--exhaustive` |
+| 模式 | full | `--regression .gstack/qa-reports/baseline.json` |
+| 输出目录 | `.gstack/qa-reports/` | `Output to /tmp/qa` |
+| 范围 | 整个应用（或 diff 范围） | `Focus on the billing page` |
+| 认证 | 无 | `Sign in to user@example.com`, `Import cookies from cookies.json` |
+
+**层级决定修复哪些问题：**
+- **Quick:** 仅修复 critical + high 严重级别
+- **Standard:** 再加 medium 严重级别（默认）
+- **Exhaustive:** 再加 low/cosmetic 严重级别
+
+**如果未提供 URL 且你位于功能分支上：** 自动进入 **diff-aware mode**（见下文“模式”）。这是最常见的情况：用户刚在某个分支上提交了代码，并希望验证其是否正常工作。
+
+**检查工作树是否干净：**
+
+```bash
+git status --porcelain
+```
+
+如果输出非空（工作树不干净），**停止** 并使用 AskUserQuestion：
+
+“你的工作树中有未提交的更改。/qa 需要一个干净的工作树，这样每个缺陷修复都能拥有各自独立的原子化提交。”
+
+- A) 提交我的更改 — 以描述性消息提交当前所有更改，然后开始 QA
+- B) 暂存我的更改 — stash 后运行 QA，结束后再 pop
+- C) 中止 — 我会手动清理
+
+建议：选择 A，因为在 QA 添加自己的修复提交之前，应先将未提交的工作保留为一个提交。
+
+在用户作出选择后，执行其选择（commit 或 stash），然后继续设置。
+
+**查找 browse 二进制文件：**
+
+{{BROWSE_SETUP}}
+
+**检查测试框架（如有需要则进行 bootstrap）：**
+
+{{TEST_BOOTSTRAP}}
+
+**创建输出目录：**
+
+```bash
+mkdir -p .gstack/qa-reports/screenshots
+```
+
+---
+
+## 测试计划上下文
+
+在退回到 git diff 启发式分析之前，先检查是否有更丰富的测试计划来源：
+
+1. **项目范围测试计划：** 检查 `~/.gstack/projects/` 中此仓库最近的 `*-test-plan-*.md` 文件
+   ```bash
+   source <(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)
+   ls -t ~/.gstack/projects/$SLUG/*-test-plan-*.md 2>/dev/null | head -1
+   ```
+2. **会话上下文：** 检查此前的 `/plan-eng-review` 或 `/plan-ceo-review` 是否在本次对话中生成过测试计划输出
+3. **使用信息更丰富的来源。** 只有在两者都不可用时，才退回到 git diff 分析。
+
+---
+
+## 阶段 1-6：QA 基线
+
+{{QA_METHODOLOGY}}
+
+在第 6 阶段结束时记录基线健康评分。
+
+---
+
+## 输出结构
+
+```
+.gstack/qa-reports/
+├── qa-report-{domain}-{YYYY-MM-DD}.md    # 结构化报告
+├── screenshots/
+│   ├── initial.png                        # 带注释的落地页截图
+│   ├── issue-001-step-1.png               # 每个问题的证据
+│   ├── issue-001-result.png
+│   ├── issue-001-before.png               # 修复前（如果已修复）
+│   ├── issue-001-after.png                # 修复后（如果已修复）
+│   └── ...
+└── baseline.json                          # 用于 regression 模式
+```
+
+报告文件名使用域名和日期：`qa-report-myapp-com-2026-03-12.md`
+
+---
+
+## 阶段 7：分诊
+
+按严重级别对所有发现的问题排序，然后根据所选层级决定修复哪些问题：
+
+- **Quick:** 仅修复 critical + high。将 medium/low 标记为“deferred”。
+- **Standard:** 修复 critical + high + medium。将 low 标记为“deferred”。
+- **Exhaustive:** 全部修复，包括 cosmetic/low 严重级别。
+
+无法从源代码修复的问题（例如第三方组件缺陷、基础设施问题）无论层级如何，都标记为“deferred”。
+
+---
+
+## 阶段 8：修复循环
+
+对每个可修复问题，按严重级别顺序执行：
+
+### 8a. 定位源代码
+
+```bash
+# Grep 搜索错误消息、组件名称、路由定义
+# Glob 搜索与受影响页面匹配的文件模式
+```
+
+- 找到导致该缺陷的源文件
+- 只修改与该问题直接相关的文件
+
+### 8b. 修复
+
+- 阅读源代码，理解上下文
+- 做出 **最小修复**，即能解决问题的最小变更
+- 不要重构周边代码，不要新增功能，也不要“改进”无关内容
+
+### 8c. 提交
+
+```bash
+git add <only-changed-files>
+git commit -m "fix(qa): ISSUE-NNN — short description"
+```
+
+- 每个修复一个提交。绝不能把多个修复合并到一起。
+- 消息格式：`fix(qa): ISSUE-NNN — short description`
+
+### 8d. 重新测试
+
+- 返回受影响的页面
+- 生成 **修复前/修复后截图对**
+- 检查 console 是否有错误
+- 使用 `snapshot -D` 验证变更是否产生预期效果
+
+```bash
+$B goto <affected-url>
+$B screenshot "$REPORT_DIR/screenshots/issue-NNN-after.png"
+$B console --errors
+$B snapshot -D
+```
+
+### 8e. 分类
+
+- **verified**：重新测试确认修复有效，且未引入新错误
+- **best-effort**：已应用修复，但无法完全验证（例如需要 auth 状态、外部服务）
+- **reverted**：检测到回归 → `git revert HEAD` → 将该问题标记为“deferred”
+
+### 8e.5. 回归测试
+
+如果满足以下任一情况则跳过：分类不是 “verified”，或者修复纯属视觉/CSS 且不涉及 JS 行为，或者未检测到测试框架且用户拒绝 bootstrap。
+
+**1. 研究项目现有的测试模式：**
+
+阅读与该修复最接近的 2-3 个测试文件（同目录、同类代码）。严格匹配：
+- 文件命名、imports、断言风格、describe/it 嵌套、setup/teardown 模式
+回归测试必须看起来像是同一位开发者编写的。
+
+**2. 追踪该缺陷的代码路径，然后编写回归测试：**
+
+在编写测试之前，追踪你刚刚修复的代码中的数据流：
+- 什么输入/状态触发了这个缺陷？（确切前置条件）
+- 它走了什么代码路径？（哪些分支、哪些函数调用）
+- 它在哪里出错？（失败的确切行/条件）
+- 还有哪些输入可能命中同一代码路径？（修复周边的边界情况）
+
+测试必须：
+- 搭建触发该缺陷的前置条件（导致问题出现的确切状态）
+- 执行暴露该缺陷的操作
+- 断言正确行为（不能只写“它能渲染”或“它不会抛错”）
+- 如果你在追踪过程中发现相邻的边界情况，也一并测试（例如 null 输入、空数组、边界值）
+- 包含完整归因注释：
+  ```
+  // 回归测试：ISSUE-NNN — {损坏内容}
+  // 由 /qa 于 {YYYY-MM-DD} 发现
+  // 报告：.gstack/qa-reports/qa-report-{domain}-{date}.md
+  ```
+
+测试类型决策：
+- Console 错误 / JS 异常 / 逻辑缺陷 → unit 或 integration test
+- 表单损坏 / API 失败 / 数据流缺陷 → 带 request/response 的 integration test
+- 带有 JS 行为的视觉问题（如下拉菜单损坏、动画异常）→ component test
+- 纯 CSS → 跳过（由 QA 重新运行捕获）
+
+生成 unit tests。模拟所有外部依赖（DB、API、Redis、file system）。
+
+使用自增命名以避免冲突：检查现有的 `{name}.regression-*.test.{ext}` 文件，取最大编号 + 1。
+
+**3. 只运行新测试文件：**
+
+```bash
+{detected test command} {new-test-file}
+```
+
+**4. 评估：**
+- 通过 → 提交：`git commit -m "test(qa): regression test for ISSUE-NNN — {desc}"`
+- 失败 → 修一次测试。仍然失败 → 删除测试，延期处理。
+- 探索耗时超过 2 分钟 → 跳过并延期处理。
+
+**5. WTF-likelihood 排除规则：** 测试提交不计入该启发式规则。
+
+### 8f. 自我约束（停止并评估）
+
+每修复 5 个问题（或每次 revert 之后），计算 WTF-likelihood：
+
+```
+WTF-LIKELIHOOD:
+  起始为 0%
+  每次 revert：               +15%
+  每个涉及 >3 个文件的修复： +5%
+  从第 15 个修复之后：       每多一个修复 +1%
+  剩余问题全部为 Low 严重级别：+10%
+  涉及无关文件：             +20%
+```
+
+**如果 WTF > 20%：** 立即停止。向用户展示目前已完成的内容，并询问是否继续。
+
+**硬上限：50 个修复。** 达到 50 个修复后，无论是否还有剩余问题，都必须停止。
+
+---
+
+## 阶段 9：最终 QA
+
+应用完所有修复后：
+
+1. 在所有受影响页面上重新运行 QA
+2. 计算最终健康评分
+3. **如果最终评分比基线更差：** 显著警告，说明出现了回归
+
+---
+
+## 阶段 10：报告
+
+将报告同时写入本地和项目范围位置：
+
+**本地：** `.gstack/qa-reports/qa-report-{domain}-{YYYY-MM-DD}.md`
+
+**项目范围：** 写入测试结果工件，以便跨会话复用上下文：
+```bash
+source <(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null) && mkdir -p ~/.gstack/projects/$SLUG
+```
+写入 `~/.gstack/projects/{slug}/{user}-{branch}-test-outcome-{datetime}.md`
+
+**每个问题需额外补充**（在标准报告模板之外）：
+- 修复状态：verified / best-effort / reverted / deferred
+- Commit SHA（如果已修复）
+- 已更改文件（如果已修复）
+- 修复前/修复后截图（如果已修复）
+
+**Summary 部分：**
+- 发现的问题总数
+- 已应用的修复（verified: X, best-effort: Y, reverted: Z）
+- 延期处理的问题
+- 健康评分变化：baseline → final
+
+**PR Summary：** 包含一行适合用于 PR 描述的摘要：
+> "QA found N issues, fixed M, health score X → Y."
+
+---
+
+## 阶段 11：更新 TODOS.md
+
+如果仓库中存在 `TODOS.md`：
+
+1. **新延期的缺陷** → 作为 TODO 添加，包含严重级别、分类和复现步骤
+2. **已修复且原本在 TODOS.md 中的缺陷** → 标注为 "Fixed by /qa on {branch}, {date}"
+
+---
+
+## 附加规则（qa 专用）
+
+11. **必须使用干净的工作树。** 如果不干净，使用 AskUserQuestion 提供 commit/stash/abort 选项后再继续。
+12. **每个修复一个提交。** 绝不能把多个修复打包进同一个提交。
+13. **只有在阶段 8e.5 生成回归测试时才能修改测试。** 绝不能修改 CI 配置。绝不能修改现有测试，只能创建新的测试文件。
+14. **发生回归时回退。** 如果某个修复让情况变得更糟，立即执行 `git revert HEAD`。
+15. **自我约束。** 遵循 WTF-likelihood 启发式规则。拿不准时，停止并询问。

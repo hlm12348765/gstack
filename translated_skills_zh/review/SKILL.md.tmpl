@@ -1,0 +1,257 @@
+---
+name: review
+version: 1.0.0
+description: |
+  预落地 PR 审查。分析相对于基线分支的 diff，检查 SQL 安全性、LLM 信任
+  边界违规、条件性副作用以及其他结构性问题。适用于
+  被要求“审查这个 PR”“代码审查”“预落地审查”或“检查我的 diff”时。
+  当用户即将合并或落地代码变更时，主动建议使用。
+allowed-tools:
+  - Bash
+  - Read
+  - Edit
+  - Write
+  - Grep
+  - Glob
+  - Agent
+  - AskUserQuestion
+  - WebSearch
+---
+
+{{PREAMBLE}}
+
+{{BASE_BRANCH_DETECT}}
+
+# 预落地 PR 审查
+
+你正在运行 `/review` 工作流。分析当前分支相对于基线分支的 diff，查找测试无法捕获的结构性问题。
+
+---
+
+## 第 1 步：检查分支
+
+1. 运行 `git branch --show-current` 获取当前分支。
+2. 如果位于基线分支，输出：**"Nothing to review — you're on the base branch or have no changes against it."** 并停止。
+3. 运行 `git fetch origin <base> --quiet && git diff origin/<base> --stat` 检查是否存在 diff。如果没有 diff，输出相同的信息并停止。
+
+---
+
+## 第 1.5 步：范围漂移检测
+
+在审查代码质量之前，先检查：**他们是否实现了被要求的内容，不多不少？**
+
+1. 读取 `TODOS.md`（如果存在）。读取 PR 描述（`gh pr view --json body --jq .body 2>/dev/null || true`）。
+   读取提交信息（`git log origin/<base>..HEAD --oneline`）。
+   **如果没有 PR：** 依赖提交信息和 TODOS.md 中说明的意图，这是常见情况，因为 /review 会在 /ship 创建 PR 之前运行。
+2. 识别**声明的意图**，也就是这个分支原本应当完成什么。
+3. 运行 `git diff origin/<base> --stat`，并将变更的文件与声明的意图进行比较。
+4. 以怀疑态度进行评估：
+
+   **SCOPE CREEP 检测：**
+   - 被修改但与声明意图无关的文件
+   - 计划中未提及的新功能或重构
+   - “既然都改到这里了……”这类扩大影响范围的改动
+
+   **MISSING REQUIREMENTS 检测：**
+   - 在 TODOS.md/PR 描述中的要求没有在 diff 中得到处理
+   - 针对声明要求的测试覆盖缺口
+   - 部分实现（开始了但没有完成）
+
+5. 输出（在正式审查开始前）：
+   ```
+   Scope Check: [CLEAN / DRIFT DETECTED / REQUIREMENTS MISSING]
+   Intent: <1-line summary of what was requested>
+   Delivered: <1-line summary of what the diff actually does>
+   [If drift: list each out-of-scope change]
+   [If missing: list each unaddressed requirement]
+   ```
+
+6. 这一步仅用于**提供信息**，不会阻塞审查。继续进入第 2 步。
+
+---
+
+## 第 2 步：读取检查清单
+
+读取 `.claude/skills/review/checklist.md`。
+
+**如果无法读取该文件，停止并报告错误。** 没有检查清单不得继续。
+
+---
+
+## 第 2.5 步：检查 Greptile 审查评论
+
+读取 `.claude/skills/review/greptile-triage.md`，并按照其中的获取、过滤、分类以及**升级检测**步骤执行。
+
+**如果没有 PR、`gh` 执行失败、API 返回错误，或 Greptile 评论数量为零：** 静默跳过这一步。Greptile 集成是附加能力，没有它审查也可以正常进行。
+
+**如果发现 Greptile 评论：** 保存分类结果（VALID & ACTIONABLE、VALID BUT ALREADY FIXED、FALSE POSITIVE、SUPPRESSED），你将在第 5 步中用到它们。
+
+---
+
+## 第 3 步：获取 diff
+
+获取最新的基线分支，以避免因本地状态过期而产生误报：
+
+```bash
+git fetch origin <base> --quiet
+```
+
+运行 `git diff origin/<base>` 获取完整 diff。其中包括相对于最新基线分支的已提交和未提交变更。
+
+---
+
+## 第 4 步：两轮审查
+
+按照检查清单对 diff 进行两轮审查：
+
+1. **第 1 轮（CRITICAL）：** SQL 与数据安全、竞态条件与并发、LLM 输出信任边界、枚举与取值完整性
+2. **第 2 轮（INFORMATIONAL）：** 条件性副作用、魔法数字与字符串耦合、死代码与一致性、LLM 提示问题、测试缺口、视图/前端、性能与包体积影响
+
+**枚举与取值完整性需要读取 diff 之外的代码。** 当 diff 引入新的枚举值、状态、层级或类型常量时，使用 Grep 查找所有引用同级取值的文件，然后读取这些文件，检查新值是否被处理。这是唯一一个仅在 diff 内审查并不足够的类别。
+
+**先搜索再建议：** 当建议某种修复模式时（尤其是并发、缓存、鉴权或框架相关行为）：
+- 确认该模式对当前使用的框架版本仍是最佳实践
+- 先检查较新版本中是否已有内建解决方案，再建议变通方案
+- 对照当前文档核实 API 签名（不同版本之间 API 会变化）
+
+这只需几秒钟，却能避免建议过时的模式。如果 WebSearch 不可用，请说明这一点，并基于已有分布内知识继续。
+
+遵循检查清单中规定的输出格式。尊重抑制规则，不要标记“DO NOT flag”部分列出的项目。
+
+---
+
+## 第 4.5 步：设计审查（有条件时）
+
+{{DESIGN_REVIEW_LITE}}
+
+将所有设计问题与第 4 步中的问题一并纳入。它们在第 5 步中遵循相同的 Fix-First 流程：机械性的 CSS 修复使用 AUTO-FIX，其他情况使用 ASK。
+
+---
+
+## 第 4.75 步：测试覆盖图
+
+{{TEST_COVERAGE_AUDIT_REVIEW}}
+
+这一步涵盖了第 2 轮中的“测试缺口”类别，不要在检查清单中的 Test Gaps 项和此覆盖图之间重复报告。将所有覆盖缺口与第 4 步和第 4.5 步中的问题一并纳入。它们遵循相同的 Fix-First 流程，缺口属于 INFORMATIONAL 问题。
+
+---
+
+## 第 5 步：Fix-First 审查
+
+**每一个问题都要有动作，不只是严重问题。**
+
+输出一个摘要标题：`Pre-Landing Review: N issues (X critical, Y informational)`
+
+### 第 5a 步：分类每个问题
+
+对于每个问题，按照 checklist.md 中的 Fix-First Heuristic 分类为 AUTO-FIX 或 ASK。严重问题倾向于 ASK；信息性问题倾向于 AUTO-FIX。
+
+### 第 5b 步：自动修复所有 AUTO-FIX 项
+
+直接应用每个修复。对每一项，输出一行摘要：
+`[AUTO-FIXED] [file:line] Problem → what you did`
+
+### 第 5c 步：将 ASK 项集中提问
+
+如果仍有 ASK 项，在一次 AskUserQuestion 中统一展示它们：
+
+- 列出每一项的编号、严重级别标签、问题描述和推荐修复方案
+- 对每一项提供选项：A) 按建议修复，B) 跳过
+- 包含一个整体性的 RECOMMENDATION
+
+示例格式：
+```
+I auto-fixed 5 issues. 2 need your input:
+
+1. [CRITICAL] app/models/post.rb:42 — Race condition in status transition
+   Fix: Add `WHERE status = 'draft'` to the UPDATE
+   → A) Fix  B) Skip
+
+2. [INFORMATIONAL] app/services/generator.rb:88 — LLM output not type-checked before DB write
+   Fix: Add JSON schema validation
+   → A) Fix  B) Skip
+
+RECOMMENDATION: Fix both — #1 is a real race condition, #2 prevents silent data corruption.
+```
+
+如果 ASK 项不超过 3 个，也可以分别使用单独的 AskUserQuestion 调用，而不是集中提问。
+
+### 第 5d 步：应用用户批准的修复
+
+对用户选择“Fix”的项目应用修复。输出已修复的内容。
+
+如果不存在 ASK 项（全部都是 AUTO-FIX），则完全跳过提问。
+
+### 结论核验
+
+在生成最终审查输出之前：
+- 如果你声称“这种模式是安全的” → 引用证明安全的具体代码行
+- 如果你声称“这里在其他地方已处理” → 读取并引用对应的处理代码
+- 如果你声称“测试覆盖了这里” → 指明测试文件和方法名
+- 不要说“可能已处理”或“应该测过了”这类话，必须核实，否则标记为未知
+
+**防止合理化：** “这里看起来没问题”不算问题结论。要么引用证据证明它确实没问题，要么标记为未验证。
+
+### Greptile 评论处理
+
+在输出你自己的问题后，如果在第 2.5 步中对 Greptile 评论进行了分类：
+
+**在输出标题中加入 Greptile 摘要：** `+ N Greptile comments (X valid, Y fixed, Z FP)`
+
+在回复任何评论之前，运行 greptile-triage.md 中的**升级检测**算法，以确定使用 Tier 1（友好）还是 Tier 2（坚定）的回复模板。
+
+1. **VALID & ACTIONABLE 评论：** 这些评论会包含在你的问题列表中，它们遵循 Fix-First 流程（机械性问题自动修复，否则集中纳入 ASK）（A: 现在修复，B: 确认，C: 误报）。如果用户选择 A（修复），使用 greptile-triage.md 中的**Fix reply template** 进行回复（包含内联 diff 和说明）。如果用户选择 C（误报），使用 **False Positive reply template** 回复（包含证据和建议的重排等级），并同时保存到项目级和全局 greptile-history。
+
+2. **FALSE POSITIVE 评论：** 通过 AskUserQuestion 分别展示每一条：
+   - 展示 Greptile 评论：file:line（或 [top-level]）+ 正文摘要 + permalink URL
+   - 简洁说明为什么这是误报
+   - 选项：
+     - A) 回复 Greptile，说明它为什么不正确（如果明显错误，推荐）
+     - B) 仍然修复它（如果工作量小且无害）
+     - C) 忽略，不回复，也不修复
+
+   如果用户选择 A，使用 greptile-triage.md 中的 **False Positive reply template** 进行回复（包含证据和建议的重排等级），并同时保存到项目级和全局 greptile-history。
+
+3. **VALID BUT ALREADY FIXED 评论：** 使用 greptile-triage.md 中的 **Already Fixed reply template** 回复，无需 AskUserQuestion：
+   - 包含已完成的处理内容和修复该问题的提交 SHA
+   - 同时保存到项目级和全局 greptile-history
+
+4. **SUPPRESSED 评论：** 静默跳过，这些是之前分诊时确认过的已知误报。
+
+---
+
+## 第 5.5 步：TODOS 交叉对照
+
+读取仓库根目录下的 `TODOS.md`（如果存在）。将 PR 与未完成的 TODO 进行交叉对照：
+
+- **这个 PR 是否解决了某些未完成的 TODO？** 如果是，在输出中说明对应条目：“This PR addresses TODO: <title>”
+- **这个 PR 是否产生了应当加入 TODO 的新工作？** 如果是，将其标记为一条信息性问题。
+- **是否存在与本次审查相关、可提供上下文的 TODO？** 如果有，在讨论相关问题时引用它们。
+
+如果 `TODOS.md` 不存在，静默跳过这一步。
+
+---
+
+## 第 5.6 步：文档过时检查
+
+将 diff 与文档文件交叉对照。对于仓库根目录中的每个 `.md` 文件（README.md、ARCHITECTURE.md、CONTRIBUTING.md、CLAUDE.md 等）：
+
+1. 检查 diff 中的代码变更是否影响该文档描述的功能、组件或工作流。
+2. 如果该文档文件在此分支中**没有**更新，但它描述的代码**已经**发生变更，则将其标记为一条 INFORMATIONAL 问题：
+   "Documentation may be stale: [file] describes [feature/component] but code changed in this branch. Consider running `/document-release`."
+
+这只是信息提示，绝不属于严重问题。修复动作是运行 `/document-release`。
+
+如果不存在文档文件，静默跳过这一步。
+
+---
+
+{{ADVERSARIAL_STEP}}
+
+## 重要规则
+
+- **评论前先读取完整 diff。** 不要标记那些已经在 diff 中修复的问题。
+- **以修复优先，而不是只读审查。** AUTO-FIX 项直接应用。ASK 项只有在用户批准后才应用。绝不提交、推送或创建 PR，这些是 /ship 的职责。
+- **保持简洁。** 一行说明问题，一行说明修复。不要写前言。
+- **只标记真实问题。** 没问题的内容直接跳过。
+- **使用 greptile-triage.md 中的 Greptile 回复模板。** 每条回复都必须包含证据。绝不发布含糊的回复。

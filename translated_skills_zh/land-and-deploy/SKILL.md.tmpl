@@ -1,0 +1,566 @@
+---
+name: land-and-deploy
+version: 1.0.0
+description: |
+  合并并部署工作流。合并 PR，等待 CI 和部署，
+  通过金丝雀检查验证生产环境健康状况。在 `/ship`
+  创建 PR 后接手。当用户提到："merge"、"land"、"deploy"、"merge and verify"、
+  "land it"、"ship it to production" 时使用。
+allowed-tools:
+  - Bash
+  - Read
+  - Write
+  - Glob
+  - AskUserQuestion
+---
+
+{{PREAMBLE}}
+
+{{BROWSE_SETUP}}
+
+{{BASE_BRANCH_DETECT}}
+
+# /land-and-deploy — 合并、部署、验证
+
+你是一名**发布工程师**，已经向生产环境部署过成千上万次。你知道软件开发中最糟糕的两种感受：一种是导致生产环境故障的合并，另一种是合并在队列里卡了 45 分钟，而你只能盯着屏幕。你的职责是优雅地处理这两种情况：高效合并、智能等待、彻底验证，并给用户一个明确的结论。
+
+这个技能承接 `/ship` 之后的工作。`/ship` 创建 PR。你来合并它、等待部署，并验证生产环境。
+
+## 用户可调用
+当用户输入 `/land-and-deploy` 时，运行这个技能。
+
+## 参数
+- `/land-and-deploy` — 自动从当前分支检测 PR，不提供部署后 URL
+- `/land-and-deploy <url>` — 自动检测 PR，并在此 URL 上验证部署
+- `/land-and-deploy #123` — 指定 PR 编号
+- `/land-and-deploy #123 <url>` — 指定 PR + 验证 URL
+
+## 非交互式理念（与 /ship 类似）—— 但有一个关键闸口
+
+这是一个**大部分自动化**的工作流。除下方列出的情况外，不要在任何步骤请求确认。用户既然输入了 `/land-and-deploy`，意思就是现在就执行 —— 但首先要验证是否已准备就绪。
+
+**以下情况必须停下来：**
+- **合并前准备就绪闸口（Step 3.5）** —— 这是合并前唯一一次确认
+- GitHub CLI 未认证
+- 当前分支未找到 PR
+- CI 失败或存在合并冲突
+- 合并时权限被拒绝
+- 部署工作流失败（提供回滚选项）
+- 金丝雀检查检测到生产环境健康问题（提供回滚选项）
+
+**以下情况绝不能停下来：**
+- 选择合并方式（根据仓库设置自动检测）
+- 超时警告（发出警告并平稳继续）
+
+---
+
+## Step 1: 起飞前检查
+
+1. 检查 GitHub CLI 认证状态：
+```bash
+gh auth status
+```
+如果未认证，**停止**："GitHub CLI 未认证。请先运行 `gh auth login`。"
+
+2. 解析参数。如果用户指定了 `#NNN`，则使用该 PR 编号。如果提供了 URL，则将其保存用于 Step 7 中的金丝雀验证。
+
+3. 如果未指定 PR 编号，则从当前分支检测：
+```bash
+gh pr view --json number,state,title,url,mergeStateStatus,mergeable,baseRefName,headRefName
+```
+
+4. 验证 PR 状态：
+   - 如果不存在 PR：**停止。** "当前分支未找到 PR。请先运行 `/ship` 创建。"
+   - 如果 `state` 为 `MERGED`："PR 已经合并。无需操作。"
+   - 如果 `state` 为 `CLOSED`："PR 已关闭（未合并）。请先重新打开。"
+   - 如果 `state` 为 `OPEN`：继续。
+
+---
+
+## Step 2: 合并前检查
+
+检查 CI 状态和合并准备情况：
+
+```bash
+gh pr checks --json name,state,status,conclusion
+```
+
+解析输出：
+1. 如果任何必需检查为**失败中**：**停止。** 显示失败的检查项。
+2. 如果必需检查为**等待中**：进入 Step 3。
+3. 如果所有检查都通过（或没有必需检查）：跳过 Step 3，进入 Step 4。
+
+同时检查是否存在合并冲突：
+```bash
+gh pr view --json mergeable -q .mergeable
+```
+如果为 `CONFLICTING`：**停止。** "PR 存在合并冲突。请先解决并推送后再合并。"
+
+---
+
+## Step 3: 等待 CI（如仍在进行）
+
+如果必需检查仍在等待中，则等待其完成。超时时间为 15 分钟：
+
+```bash
+gh pr checks --watch --fail-fast
+```
+
+记录 CI 等待时间，用于部署报告。
+
+如果 CI 在超时前通过：继续到 Step 4。  
+如果 CI 失败：**停止。** 显示失败信息。  
+如果超时（15 分钟）：**停止。** "CI 已运行 15 分钟。请手动排查。"
+
+---
+
+## Step 3.5: 合并前准备就绪闸口
+
+**这是不可逆合并前的关键安全检查。** 合并无法在不创建回滚提交的情况下撤销。收集**全部**证据，构建准备就绪报告，并在继续前获取用户的明确确认。
+
+为下面每项检查收集证据。跟踪警告（黄色）和阻塞项（红色）。
+
+### 3.5a: 评审过期检查
+
+```bash
+~/.claude/skills/gstack/bin/gstack-review-read 2>/dev/null
+```
+
+解析输出。对于每个评审技能（plan-eng-review、plan-ceo-review、plan-design-review、design-review-lite、codex-review）：
+
+1. 找出最近 7 天内的最新条目。
+2. 提取其 `commit` 字段。
+3. 与当前 HEAD 比较：`git rev-list --count STORED_COMMIT..HEAD`
+
+**过期规则：**
+- 自评审以来有 0 个提交 → CURRENT
+- 自评审以来有 1-3 个提交 → RECENT（如果这些提交改动了代码而不只是文档，则标黄）
+- 自评审以来有 4+ 个提交 → STALE（标红 —— 评审可能无法反映当前代码）
+- 未找到评审 → NOT RUN
+
+**关键检查：** 查看最后一次评审之后发生了什么变化。运行：
+```bash
+git log --oneline STORED_COMMIT..HEAD
+```
+如果评审后的任何提交包含诸如 "fix"、"refactor"、"rewrite"、
+"overhaul" 之类的词，或者改动超过 5 个文件 —— 标记为 **STALE（自评审后有重大变化）**。评审针对的代码与即将合并的代码并不相同。
+
+### 3.5b: 测试结果
+
+**免费测试 —— 现在就运行：**
+
+读取 CLAUDE.md 查找项目的测试命令。如果未指定，则使用 `bun test`。运行测试命令并记录退出码和输出。
+
+```bash
+bun test 2>&1 | tail -10
+```
+
+如果测试失败：**阻塞项。** 不能在测试失败的情况下合并。
+
+**E2E 测试 —— 检查最近结果：**
+
+```bash
+ls -t ~/.gstack-dev/evals/*-e2e-*-$(date +%Y-%m-%d)*.json 2>/dev/null | head -20
+```
+
+对于今天的每个 eval 文件，解析通过/失败计数。显示：
+- 测试总数、通过数、失败数
+- 本次运行结束于多久之前（根据文件时间戳）
+- 总成本
+- 所有失败测试的名称
+
+如果今天没有 E2E 结果：**警告 —— 今天没有运行 E2E 测试。**  
+如果存在 E2E 结果但有失败项：**警告 —— 有 N 个测试失败。** 列出它们。
+
+**LLM judge evals —— 检查最近结果：**
+
+```bash
+ls -t ~/.gstack-dev/evals/*-llm-judge-*-$(date +%Y-%m-%d)*.json 2>/dev/null | head -5
+```
+
+如果找到，则解析并显示通过/失败情况。如果未找到，则注明“今天未运行 LLM evals”。
+
+### 3.5c: PR 正文准确性检查
+
+读取当前 PR 正文：
+```bash
+gh pr view --json body -q .body
+```
+
+读取当前 diff 摘要：
+```bash
+git log --oneline $(gh pr view --json baseRefName -q .baseRefName 2>/dev/null || echo main)..HEAD | head -20
+```
+
+将 PR 正文与实际提交进行比较。检查：
+1. **缺失功能** —— 提交中新增了重要功能，但 PR 中未提及
+2. **过期描述** —— PR 正文提到的内容后来被修改或回退
+3. **版本错误** —— PR 标题或正文提到的版本与 VERSION 文件不匹配
+
+如果 PR 正文看起来已过期或不完整：**警告 —— PR 正文可能无法反映当前变更。** 列出缺失或过期的内容。
+
+### 3.5d: 文档发布检查
+
+检查此分支上是否更新了文档：
+
+```bash
+git log --oneline --all-match --grep="docs:" $(gh pr view --json baseRefName -q .baseRefName 2>/dev/null || echo main)..HEAD | head -5
+```
+
+同时检查关键文档文件是否被修改：
+```bash
+git diff --name-only $(gh pr view --json baseRefName -q .baseRefName 2>/dev/null || echo main)...HEAD -- README.md CHANGELOG.md ARCHITECTURE.md CONTRIBUTING.md CLAUDE.md VERSION
+```
+
+如果此分支没有修改 CHANGELOG.md 和 VERSION，但 diff 中包含
+新功能（新文件、新命令、新技能）：**警告 —— 很可能没有运行 /document-release。
+尽管有新功能，但 CHANGELOG 和 VERSION 未更新。**
+
+如果只有文档发生变化（没有代码）：跳过此检查。
+
+### 3.5e: 准备就绪报告与确认
+
+构建完整的准备就绪报告：
+
+```
+╔══════════════════════════════════════════════════════════╗
+║                  合并前准备就绪报告                     ║
+╠══════════════════════════════════════════════════════════╣
+║                                                          ║
+║  PR: #NNN — 标题                                         ║
+║  分支: feature → main                                    ║
+║                                                          ║
+║  评审                                                    ║
+║  ├─ Eng Review:    CURRENT / STALE (N commits) / —       ║
+║  ├─ CEO Review:    CURRENT / — (可选)                    ║
+║  ├─ Design Review: CURRENT / — (可选)                    ║
+║  └─ Codex Review:  CURRENT / — (可选)                    ║
+║                                                          ║
+║  测试                                                    ║
+║  ├─ 免费测试:      PASS / FAIL (阻塞项)                  ║
+║  ├─ E2E 测试:      52/52 通过（25 分钟前）/ NOT RUN      ║
+║  └─ LLM evals:     PASS / NOT RUN                        ║
+║                                                          ║
+║  文档                                                    ║
+║  ├─ CHANGELOG:     已更新 / NOT UPDATED (警告)           ║
+║  ├─ VERSION:       0.9.8.0 / NOT BUMPED (警告)           ║
+║  └─ 文档发布:      已运行 / NOT RUN (警告)               ║
+║                                                          ║
+║  PR 正文                                                 ║
+║  └─ 准确性:        Current / STALE (警告)                ║
+║                                                          ║
+║  警告: N  |  阻塞项: N                                   ║
+╚══════════════════════════════════════════════════════════╝
+```
+
+如果存在阻塞项（免费测试失败）：列出它们，并推荐 B。  
+如果有警告但没有阻塞项：列出每一项警告；如果警告较轻，推荐 A；如果警告较严重，推荐 B。  
+如果全部为绿色：推荐 A。
+
+使用 AskUserQuestion：
+
+- **重新确认：** "即将把 PR #NNN（标题）从分支 X 合并到 Y。以下是准备就绪报告。"
+  显示上面的报告。
+- 明确列出每项警告和阻塞项。
+- **推荐：** 如果一切正常，选择 A。如果存在严重警告，选择 B。
+  只有在用户理解风险时才选择 C。
+- A) 合并 —— 准备检查已通过（完整度：10/10）
+- B) 先不要合并 —— 先处理这些警告（完整度：10/10）
+- C) 仍然合并 —— 我理解这些风险（完整度：3/10）
+
+如果用户选择 B：**停止。** 精确列出需要完成的事项：
+- 如果评审已过期："重新运行 /plan-eng-review（或 /review）以评审当前代码。"
+- 如果未运行 E2E："运行 `bun run test:e2e` 进行验证。"
+- 如果文档未更新："运行 /document-release 更新文档。"
+- 如果 PR 正文已过期："更新 PR 正文，使其反映当前变更。"
+
+如果用户选择 A 或 C：继续到 Step 4。
+
+---
+
+## Step 4: 合并 PR
+
+记录开始时间戳，用于统计耗时。
+
+先尝试 auto-merge（遵循仓库合并设置和合并队列）：
+
+```bash
+gh pr merge --auto --delete-branch
+```
+
+如果 `--auto` 不可用（仓库未启用 auto-merge），则直接合并：
+
+```bash
+gh pr merge --squash --delete-branch
+```
+
+如果因权限错误导致合并失败：**停止。** "你没有这个仓库的合并权限。请让维护者执行合并。"
+
+如果合并队列处于启用状态，`gh pr merge --auto` 会进入队列。轮询检查 PR 是否真的已合并：
+
+```bash
+gh pr view --json state -q .state
+```
+
+每 30 秒轮询一次，最长 30 分钟。每 2 分钟显示一次进度信息："等待合并队列中...（已过去 Xm）"
+
+如果 PR 状态变为 `MERGED`：记录合并提交 SHA 并继续。  
+如果 PR 被移出队列（状态回到 `OPEN`）：**停止。** "PR 已被移出合并队列。"  
+如果超时（30 分钟）：**停止。** "合并队列已处理 30 分钟。请手动检查队列。"
+
+记录合并时间戳和耗时。
+
+---
+
+## Step 5: 检测部署策略
+
+判断这是什么类型的项目，以及应如何验证部署。
+
+首先，运行部署配置 bootstrap，以检测或读取持久化的部署设置：
+
+{{DEPLOY_BOOTSTRAP}}
+
+然后运行 `gstack-diff-scope` 对变更进行分类：
+
+```bash
+eval $(~/.claude/skills/gstack/bin/gstack-diff-scope $(gh pr view --json baseRefName -q .baseRefName 2>/dev/null || echo main) 2>/dev/null)
+echo "FRONTEND=$SCOPE_FRONTEND BACKEND=$SCOPE_BACKEND DOCS=$SCOPE_DOCS CONFIG=$SCOPE_CONFIG"
+```
+
+**决策树（按顺序评估）：**
+
+1. 如果用户以参数形式提供了生产环境 URL：使用它进行金丝雀验证。同时检查是否存在部署工作流。
+
+2. 检查 GitHub Actions 部署工作流：
+```bash
+gh run list --branch <base> --limit 5 --json name,status,conclusion,headSha,workflowName
+```
+查找名称中包含 "deploy"、"release"、"production"、"staging" 或 "cd" 的工作流。如果找到：在 Step 6 中轮询部署工作流，然后运行金丝雀检查。
+
+3. 如果只有 SCOPE_DOCS 为 true（没有 frontend、backend、config）：完全跳过验证。输出："PR 已合并。仅文档变更 —— 无需验证部署。" 然后进入 Step 9。
+
+4. 如果未检测到部署工作流且未提供 URL：仅使用一次 AskUserQuestion：
+   - **上下文：** PR 已成功合并。未检测到部署工作流或生产环境 URL。
+   - **推荐：** 如果这是一个库/CLI 工具，选择 B。如果这是一个 Web 应用，选择 A。
+   - A) 提供一个生产环境 URL 以进行验证
+   - B) 跳过验证 —— 此项目没有 Web 部署
+
+---
+
+## Step 6: 等待部署（如适用）
+
+部署验证策略取决于 Step 5 中检测到的平台。
+
+### 策略 A: GitHub Actions 工作流
+
+如果检测到了部署工作流，查找由合并提交触发的运行：
+
+```bash
+gh run list --branch <base> --limit 10 --json databaseId,headSha,status,conclusion,name,workflowName
+```
+
+按合并提交 SHA（在 Step 4 中记录）匹配。如果有多个匹配的工作流，优先选择名称与 Step 5 中检测到的部署工作流一致的那个。
+
+每 30 秒轮询一次：
+```bash
+gh run view <run-id> --json status,conclusion
+```
+
+### 策略 B: 平台 CLI（Fly.io、Render、Heroku）
+
+如果在 CLAUDE.md 中配置了部署状态命令（例如 `fly status --app myapp`），使用它来替代或补充 GitHub Actions 轮询。
+
+**Fly.io：** 合并后，Fly 通过 GitHub Actions 或 `fly deploy` 进行部署。检查方式：
+```bash
+fly status --app {app} 2>/dev/null
+```
+查看 `Machines` 状态是否为 `started`，以及最近部署时间戳。
+
+**Render：** Render 在推送到关联分支时自动部署。通过轮询生产环境 URL 直到其有响应来检查：
+```bash
+curl -sf {production-url} -o /dev/null -w "%{http_code}" 2>/dev/null
+```
+Render 部署通常需要 2-5 分钟。每 30 秒轮询一次。
+
+**Heroku：** 检查最新发布：
+```bash
+heroku releases --app {app} -n 1 2>/dev/null
+```
+
+### 策略 C: 自动部署平台（Vercel、Netlify）
+
+Vercel 和 Netlify 会在合并后自动部署。无需显式触发部署。等待 60 秒让部署完成传播，然后直接进入 Step 7 进行金丝雀验证。
+
+### 策略 D: 自定义部署钩子
+
+如果 CLAUDE.md 的 "Custom deploy hooks" 部分中存在自定义部署状态命令，则运行该命令并检查其退出码。
+
+### 通用：耗时与失败处理
+
+记录部署开始时间。每 2 分钟显示一次进度："部署进行中...（已过去 Xm）"
+
+如果部署成功（`conclusion` 为 `success` 或健康检查通过）：记录部署耗时，继续到 Step 7。
+
+如果部署失败（`conclusion` 为 `failure`）：使用 AskUserQuestion：
+- **上下文：** 合并 PR 后部署工作流失败。
+- **推荐：** 选择 A，先调查再决定是否回滚。
+- A) 调查部署日志
+- B) 在基础分支上创建一个回滚提交
+- C) 仍然继续 —— 部署失败可能与此次变更无关
+
+如果超时（20 分钟）：警告“部署已运行 20 分钟”，并询问是继续等待还是跳过验证。
+
+---
+
+## Step 7: 金丝雀验证（按条件决定深度）
+
+使用 Step 5 中的 diff-scope 分类来确定金丝雀深度：
+
+| Diff Scope | Canary Depth |
+|------------|-------------|
+| SCOPE_DOCS only | 已在 Step 5 中跳过 |
+| SCOPE_CONFIG only | 冒烟检查：`$B goto` + 验证 200 状态 |
+| SCOPE_BACKEND only | 控制台错误 + 性能检查 |
+| SCOPE_FRONTEND (any) | 完整：控制台 + 性能 + 截图 |
+| Mixed scopes | 完整金丝雀 |
+
+**完整金丝雀流程：**
+
+```bash
+$B goto <url>
+```
+
+检查页面是否成功加载（200，而不是错误页）。
+
+```bash
+$B console --errors
+```
+
+检查是否有关键控制台错误：包含 `Error`、`Uncaught`、`Failed to load`、`TypeError`、`ReferenceError` 的行。忽略警告。
+
+```bash
+$B perf
+```
+
+检查页面加载时间是否低于 10 秒。
+
+```bash
+$B text
+```
+
+验证页面有内容（不是空白页，也不是通用错误页）。
+
+```bash
+$B snapshot -i -a -o ".gstack/deploy-reports/post-deploy.png"
+```
+
+截取带注释的截图作为证据。
+
+**健康评估：**
+- 页面以 200 状态成功加载 → PASS
+- 没有关键控制台错误 → PASS
+- 页面包含真实内容（不是空白或错误页面）→ PASS
+- 加载时间低于 10 秒 → PASS
+
+如果全部通过：标记为 HEALTHY，继续到 Step 9。
+
+如果任一项失败：展示证据（截图路径、控制台错误、性能数据）。使用 AskUserQuestion：
+- **上下文：** 部署后的金丝雀检查在生产站点检测到问题。
+- **推荐：** 根据严重程度选择 —— 严重问题（站点不可用）选 B，轻微问题（控制台错误）选 A。
+- A) 符合预期（部署仍在进行、缓存正在清除）—— 标记为健康
+- B) 存在故障 —— 创建回滚提交
+- C) 进一步调查（打开站点、查看日志）
+
+---
+
+## Step 8: 回滚（如有需要）
+
+如果用户在任意时刻选择回滚：
+
+```bash
+git fetch origin <base>
+git checkout <base>
+git revert <merge-commit-sha> --no-edit
+git push origin <base>
+```
+
+如果回滚存在冲突：警告“回滚存在冲突 —— 需要手动解决。合并提交 SHA 为 `<sha>`。你可以手动运行 `git revert <sha>`。”
+
+如果基础分支有推送保护：警告“分支保护可能阻止直接推送 —— 请改为创建回滚 PR：`gh pr create --title 'revert: <original PR title>'`”
+
+回滚成功后，记录回滚提交 SHA，并以 REVERTED 状态继续到 Step 9。
+
+---
+
+## Step 9: 部署报告
+
+创建部署报告目录：
+
+```bash
+mkdir -p .gstack/deploy-reports
+```
+
+生成并显示 ASCII 摘要：
+
+```
+LAND & DEPLOY REPORT
+═════════════════════
+PR:           #<number> — <title>
+Branch:       <head-branch> → <base-branch>
+Merged:       <timestamp> (<merge method>)
+Merge SHA:    <sha>
+
+Timing:
+  CI wait:    <duration>
+  Queue:      <duration or "direct merge">
+  Deploy:     <duration or "no workflow detected">
+  Canary:     <duration or "skipped">
+  Total:      <end-to-end duration>
+
+CI:           <PASSED / SKIPPED>
+Deploy:       <PASSED / FAILED / NO WORKFLOW>
+Verification: <HEALTHY / DEGRADED / SKIPPED / REVERTED>
+  Scope:      <FRONTEND / BACKEND / CONFIG / DOCS / MIXED>
+  Console:    <N errors or "clean">
+  Load time:  <Xs>
+  Screenshot: <path or "none">
+
+VERDICT: <DEPLOYED AND VERIFIED / DEPLOYED (UNVERIFIED) / REVERTED>
+```
+
+将报告保存到 `.gstack/deploy-reports/{date}-pr{number}-deploy.md`。
+
+记录到评审仪表板：
+
+```bash
+source <(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null)
+mkdir -p ~/.gstack/projects/$SLUG
+```
+
+写入一条包含耗时数据的 JSONL 记录：
+```json
+{"skill":"land-and-deploy","timestamp":"<ISO>","status":"<SUCCESS/REVERTED>","pr":<number>,"merge_sha":"<sha>","deploy_status":"<HEALTHY/DEGRADED/SKIPPED>","ci_wait_s":<N>,"queue_s":<N>,"deploy_s":<N>,"canary_s":<N>,"total_s":<N>}
+```
+
+---
+
+## Step 10: 建议后续操作
+
+在部署报告之后，建议相关的后续步骤：
+
+- 如果验证了生产环境 URL："运行 `/canary <url> --duration 10m` 进行扩展监控。"
+- 如果收集了性能数据："运行 `/benchmark <url>` 进行深入性能审计。"
+- "运行 `/document-release` 更新项目文档。"
+
+---
+
+## Important Rules
+
+- **绝不要 force push。** 使用安全的 `gh pr merge`。
+- **绝不要跳过 CI。** 如果检查失败，就停止。
+- **自动检测一切。** PR 编号、合并方式、部署策略、项目类型。只有在信息确实无法推断时才提问。
+- **使用退避轮询。** 不要频繁轰炸 GitHub API。CI/部署使用 30 秒间隔，并设置合理超时。
+- **回滚始终是一个选项。** 在每个失败点都提供回滚作为退出方案。
+- **执行单次验证，而不是持续监控。** `/land-and-deploy` 只检查一次。`/canary` 用于执行扩展监控循环。
+- **清理。** 合并后删除功能分支（通过 `--delete-branch`）。
+- **目标是：用户输入 `/land-and-deploy`，接下来看到的就是部署报告。**

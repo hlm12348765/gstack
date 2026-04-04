@@ -1,0 +1,833 @@
+---
+name: retro
+version: 2.0.0
+description: |
+  每周工程复盘。分析提交历史、工作模式和代码质量指标，
+  并持续记录历史与追踪趋势。
+  具备团队感知能力：按个人拆分贡献，并给出表扬与成长空间。
+  当被要求执行 “weekly retro”、“what did we ship” 或 “engineering retrospective” 时使用。
+  在工作周或冲刺结束时主动建议使用。
+allowed-tools:
+  - Bash
+  - Read
+  - Write
+  - Glob
+  - AskUserQuestion
+---
+
+{{PREAMBLE}}
+
+## 检测默认分支
+
+在收集数据之前，先检测仓库的默认分支名称：
+`gh repo view --json defaultBranchRef -q .defaultBranchRef.name`
+
+如果失败，则回退到 `main`。在下文说明中凡是提到
+`origin/<default>` 的地方，都使用检测到的名称。
+
+---
+
+# /retro — 每周工程复盘
+
+生成一份全面的工程复盘，分析提交历史、工作模式和代码质量指标。具备团队感知能力：识别运行命令的用户，然后分析每位贡献者，并按个人给出表扬和成长机会。面向使用 Claude Code 作为倍增器的资深 IC/CTO 级构建者而设计。
+
+## 用户可调用
+当用户输入 `/retro` 时，运行此技能。
+
+## 参数
+- `/retro` — 默认：最近 7 天
+- `/retro 24h` — 最近 24 小时
+- `/retro 14d` — 最近 14 天
+- `/retro 30d` — 最近 30 天
+- `/retro compare` — 比较当前时间窗口与此前相同长度的时间窗口
+- `/retro compare 14d` — 使用显式时间窗口进行比较
+- `/retro global` — 跨所有 AI 编码工具的跨项目复盘（默认 7 天）
+- `/retro global 14d` — 使用显式时间窗口进行跨项目复盘
+
+## 说明
+
+解析参数以确定时间窗口。如果未提供参数，则默认使用 7 天。所有时间都应以用户的**本地时区**报告（使用系统默认值，不要设置 `TZ`）。
+
+**按午夜对齐的时间窗口：** 对于天（`d`）和周（`w`）单位，计算本地午夜的绝对开始日期，而不是相对字符串。例如，如果今天是 2026-03-18，窗口为 7 天：开始日期应为 2026-03-11。对 git log 查询使用 `--since="2026-03-11T00:00:00"`，明确的 `T00:00:00` 后缀可确保 git 从午夜开始。否则，git 会使用当前挂钟时间（例如，晚上 11 点执行 `--since="2026-03-11"` 表示的是晚上 11 点，而不是午夜）。对于周单位，乘以 7 转换为天数（例如，`2w` = 往前 14 天）。对于小时（`h`）单位，使用 `--since="N hours ago"`，因为午夜对齐不适用于不足一天的窗口。
+
+**参数校验：** 如果参数不匹配数字加 `d`、`h` 或 `w`，或者单词 `compare`（可选跟一个窗口），或者单词 `global`（可选跟一个窗口），则显示以下用法并停止：
+```text
+用法: /retro [window | compare | global]
+  /retro              — 最近 7 天（默认）
+  /retro 24h          — 最近 24 小时
+  /retro 14d          — 最近 14 天
+  /retro 30d          — 最近 30 天
+  /retro compare      — 比较本周期与上一周期
+  /retro compare 14d  — 使用显式时间窗口比较
+  /retro global       — 跨所有 AI 工具的跨项目复盘（默认 7 天）
+  /retro global 14d   — 使用显式时间窗口进行跨项目复盘
+```
+
+**如果第一个参数是 `global`：** 跳过常规的仓库范围复盘（步骤 1-14）。改为遵循本文档末尾的**全局复盘**流程。可选的第二个参数是时间窗口（默认 7d）。此模式**不要求**位于 git 仓库中。
+
+### 步骤 1：收集原始数据
+
+首先，抓取 origin 并识别当前用户：
+```bash
+git fetch origin <default> --quiet
+# 识别是谁在运行复盘
+git config user.name
+git config user.email
+```
+
+`git config user.name` 返回的名字就是**“你”**，也就是正在阅读这份复盘的人。所有其他作者都是队友。用它来组织叙述：“你的”提交与队友的贡献。
+
+并行运行以下**所有** git 命令（它们彼此独立）：
+
+```bash
+# 1. 时间窗口内的所有提交，包含时间戳、主题、hash、AUTHOR、变更文件、插入行数、删除行数
+git log origin/<default> --since="<window>" --format="%H|%aN|%ae|%ai|%s" --shortstat
+
+# 2. 按提交统计测试代码与总代码行数，并附带作者
+#    每个提交块以 COMMIT:<hash>|<author> 开头，后跟 numstat 行。
+#    将测试文件（匹配 test/|spec/|__tests__/）与生产文件分开。
+git log origin/<default> --since="<window>" --format="COMMIT:%H|%aN" --numstat
+
+# 3. 用于检测会话和小时分布的提交时间戳（含作者）
+git log origin/<default> --since="<window>" --format="%at|%aN|%ai|%s" | sort -n
+
+# 4. 变更最频繁的文件（热点分析）
+git log origin/<default> --since="<window>" --format="" --name-only | grep -v '^$' | sort | uniq -c | sort -rn
+
+# 5. 从提交信息中提取 PR 编号（提取 #NNN 模式）
+git log origin/<default> --since="<window>" --format="%s" | grep -oE '#[0-9]+' | sed 's/^#//' | sort -n | uniq | sed 's/^/#/'
+
+# 6. 按作者统计文件热点（谁改了什么）
+git log origin/<default> --since="<window>" --format="AUTHOR:%aN" --name-only
+
+# 7. 按作者统计提交数量（快速汇总）
+git shortlog origin/<default> --since="<window>" -sn --no-merges
+
+# 8. Greptile 分诊历史（如果可用）
+cat ~/.gstack/greptile-history.md 2>/dev/null || true
+
+# 9. TODOS.md 积压项（如果可用）
+cat TODOS.md 2>/dev/null || true
+
+# 10. 测试文件数量
+find . -name '*.test.*' -o -name '*.spec.*' -o -name '*_test.*' -o -name '*_spec.*' 2>/dev/null | grep -v node_modules | wc -l
+
+# 11. 时间窗口内的回归测试提交
+git log origin/<default> --since="<window>" --oneline --grep="test(qa):" --grep="test(design):" --grep="test: coverage"
+
+# 12. gstack 技能使用遥测（如果可用）
+cat ~/.gstack/analytics/skill-usage.jsonl 2>/dev/null || true
+
+# 12. 时间窗口内变更过的测试文件
+git log origin/<default> --since="<window>" --format="" --name-only | grep -E '\.(test|spec)\.' | sort -u | wc -l
+```
+
+### 步骤 2：计算指标
+
+计算并在汇总表中展示以下指标：
+
+| Metric | Value |
+|--------|-------|
+| Commits to main | N |
+| Contributors | N |
+| PRs merged | N |
+| Total insertions | N |
+| Total deletions | N |
+| Net LOC added | N |
+| Test LOC (insertions) | N |
+| Test LOC ratio | N% |
+| Version range | vX.Y.Z.W → vX.Y.Z.W |
+| Active days | N |
+| Detected sessions | N |
+| Avg LOC/session-hour | N |
+| Greptile signal | N% (Y catches, Z FPs) |
+| Test Health | N total tests · M added this period · K regression tests |
+
+然后立即在下方显示**按作者排序的排行榜**：
+
+```text
+Contributor         Commits   +/-          Top area
+You (garry)              32   +2400/-300   browse/
+alice                    12   +800/-150    app/services/
+bob                       3   +120/-40     tests/
+```
+
+按提交数降序排序。当前用户（来自 `git config user.name`）始终排在第一位，并标记为 “You (name)”。
+
+**Greptile signal（如果存在历史）：** 读取 `~/.gstack/greptile-history.md`（步骤 1 的命令 8 已获取）。按日期筛选处于复盘时间窗口内的条目。按类型统计条目：`fix`、`fp`、`already-fixed`。计算信号比率：`(fix + already-fixed) / (fix + already-fixed + fp)`。如果窗口内没有条目，或文件不存在，则跳过 Greptile 指标行。无法解析的行静默跳过。
+
+**Backlog Health（如果存在 TODOS.md）：** 读取 `TODOS.md`（步骤 1 的命令 9 已获取）。计算：
+- 打开状态的 TODO 总数（排除 `## Completed` 部分中的条目）
+- P0/P1 数量（关键/紧急项）
+- P2 数量（重要项）
+- 本周期完成的条目数（Completed 部分中日期位于复盘窗口内的条目）
+- 本周期新增的条目数（交叉比对时间窗口内修改过 `TODOS.md` 的 git log 提交）
+
+在指标表中加入：
+```text
+| Backlog Health | N open (X P0/P1, Y P2) · Z completed this period |
+```
+
+如果 `TODOS.md` 不存在，则跳过 Backlog Health 行。
+
+**Skill Usage（如果存在分析数据）：** 如果 `~/.gstack/analytics/skill-usage.jsonl` 存在，则读取它。按 `ts` 字段筛选位于复盘时间窗口内的条目。将技能激活（无 `event` 字段）与 hook 触发（`event: "hook_fire"`）分开。按技能名聚合。展示为：
+
+```text
+| Skill Usage | /ship(12) /qa(8) /review(5) · 3 safety hook fires |
+```
+
+如果 JSONL 文件不存在，或者窗口内没有条目，则跳过 Skill Usage 行。
+
+**Eureka Moments（如果已记录）：** 如果 `~/.gstack/analytics/eureka.jsonl` 存在，则读取它。按 `ts` 字段筛选位于复盘时间窗口内的条目。对于每个 eureka moment，展示标记它的技能、分支以及一行洞察摘要。展示为：
+
+```text
+| Eureka Moments | 2 this period |
+```
+
+如果存在记录，则列出它们：
+```text
+  EUREKA /office-hours (branch: garrytan/auth-rethink): "Session tokens don't need server storage — browser crypto API makes client-side JWT validation viable"
+  EUREKA /plan-eng-review (branch: garrytan/cache-layer): "Redis isn't needed here — Bun's built-in LRU cache handles this workload"
+```
+
+如果 JSONL 文件不存在，或者窗口内没有条目，则跳过 Eureka Moments 行。
+
+### 步骤 3：提交时间分布
+
+使用本地时间的柱状图显示按小时统计的直方图：
+
+```text
+Hour  Commits  ████████████████
+ 00:    4      ████
+ 07:    5      █████
+ ...
+```
+
+识别并指出：
+- 高峰时段
+- 低谷时段
+- 模式是双峰型（早晨/晚上）还是连续型
+- 深夜编码聚集（晚上 10 点以后）
+
+### 步骤 4：工作会话检测
+
+使用连续提交之间**45 分钟间隔**的阈值检测会话。对每个会话报告：
+- 开始/结束时间（Pacific）
+- 提交数量
+- 持续时间（分钟）
+
+对会话分类：
+- **Deep sessions**（50+ 分钟）
+- **Medium sessions**（20-50 分钟）
+- **Micro sessions**（<20 分钟，通常是单次提交、快速完成）
+
+计算：
+- 活跃编码总时长（所有会话持续时间之和）
+- 平均会话时长
+- 每小时活跃时间的 LOC
+
+### 步骤 5：提交类型拆分
+
+按 conventional commit 前缀（feat/fix/refactor/test/chore/docs）分类。以百分比条形图展示：
+
+```text
+feat:     20  (40%)  ████████████████████
+fix:      27  (54%)  ███████████████████████████
+refactor:  2  ( 4%)  ██
+```
+
+如果 fix 占比超过 50%，要标记出来，这表示一种“快速上线，快速修复”的模式，可能说明评审存在缺口。
+
+### 步骤 6：热点分析
+
+显示变更次数最多的前 10 个文件。标记：
+- 被修改 5 次以上的文件（高 churn 热点）
+- 热点列表中的测试文件与生产文件
+- VERSION/CHANGELOG 的变更频率（版本纪律指标）
+
+### 步骤 7：PR 大小分布
+
+根据提交 diff 估算 PR 大小，并分桶：
+- **Small**（<100 LOC）
+- **Medium**（100-500 LOC）
+- **Large**（500-1500 LOC）
+- **XL**（1500+ LOC）
+
+### 步骤 8：专注分数 + 本周最佳交付
+
+**专注分数：** 计算触及单个变更最多的顶层目录（例如 `app/services/`、`app/views/`）的提交占比。分数越高表示工作越聚焦。分数越低表示上下文切换越分散。报告格式为：“Focus score: 62% (app/services/)”
+
+**本周最佳交付：** 自动识别时间窗口内 LOC 最高的单个 PR。重点突出：
+- PR 编号与标题
+- 变更的 LOC
+- 它为什么重要（根据提交信息和变更文件推断）
+
+### 步骤 9：团队成员分析
+
+对每位贡献者（包括当前用户），计算：
+
+1. **提交与 LOC** — 提交总数、插入行数、删除行数、净 LOC
+2. **关注领域** — 他们最常触及的目录/文件（前 3 个）
+3. **提交类型构成** — 他们个人的 feat/fix/refactor/test 拆分
+4. **会话模式** — 他们何时编码（高峰时段）、会话数
+5. **测试纪律** — 他们个人的测试 LOC 占比
+6. **最大交付** — 他们在窗口内单个影响最大的提交或 PR
+
+**对于当前用户（“You”）：** 这一部分需要最深入的处理。包含单人复盘中的全部细节：会话分析、时间模式、专注分数。用第一人称框定：“Your peak hours...”、“Your biggest ship...”
+
+**对于每位队友：** 写 2-3 句话，说明他们做了什么以及他们的模式。然后：
+
+- **Praise**（1-2 个具体点）：必须锚定在真实提交上。不要写 “great work”，而要准确说明哪里做得好。示例：“Shipped the entire auth middleware rewrite in 3 focused sessions with 45% test coverage”、“Every PR under 200 LOC — disciplined decomposition.”
+- **Opportunity for growth**（1 个具体点）：作为进阶建议而不是批评来表达。锚定在真实数据上。示例：“Test ratio was 12% this week — adding test coverage to the payment module before it gets more complex would pay off”、“5 fix commits on the same file suggest the original PR could have used a review pass.”
+
+**如果只有一位贡献者（单人仓库）：** 跳过团队拆分，按之前方式继续，复盘是个人向的。
+
+**如果存在 Co-Authored-By trailers：** 解析提交信息中的 `Co-Authored-By:` 行。除主作者外，也将这些作者记入该提交的贡献。记录 AI 协作者（例如 `noreply@anthropic.com`），但不要将其列为团队成员，而是把 “AI-assisted commits” 作为单独指标跟踪。
+
+### 步骤 10：周环比趋势（如果窗口 >= 14d）
+
+如果时间窗口不少于 14 天，则按周拆分并显示趋势：
+- 每周提交数（总数和按作者）
+- 每周 LOC
+- 每周测试占比
+- 每周 fix 占比
+- 每周会话数
+
+### 步骤 11：连续记录追踪
+
+统计回溯到今天为止，连续每天至少有 1 次提交到 origin/<default> 的天数。同时跟踪团队连续记录和个人连续记录：
+
+```bash
+# 团队连续记录：所有唯一提交日期（本地时间）——无硬性截断
+git log origin/<default> --format="%ad" --date=format:"%Y-%m-%d" | sort -u
+
+# 个人连续记录：仅当前用户的提交
+git log origin/<default> --author="<user_name>" --format="%ad" --date=format:"%Y-%m-%d" | sort -u
+```
+
+从今天开始向后倒数，有多少连续天至少有一次提交？这里查询的是完整历史，因此任意长度的连续记录都能被准确报告。两者都要显示：
+- “Team shipping streak: 47 consecutive days”
+- “Your shipping streak: 32 consecutive days”
+
+### 步骤 12：加载历史并比较
+
+在保存新快照之前，先检查先前的复盘历史：
+
+```bash
+ls -t .context/retros/*.json 2>/dev/null
+```
+
+**如果存在先前复盘：** 使用 Read 工具加载最新的一份。计算关键指标的差值，并加入一个 **Trends vs Last Retro** 部分：
+```text
+                    Last        Now         Delta
+Test ratio:         22%    →    41%         ↑19pp
+Sessions:           10     →    14          ↑4
+LOC/hour:           200    →    350         ↑75%
+Fix ratio:          54%    →    30%         ↓24pp (improving)
+Commits:            32     →    47          ↑47%
+Deep sessions:      3      →    5           ↑2
+```
+
+**如果不存在先前复盘：** 跳过比较部分，并追加：“First retro recorded — run again next week to see trends.”
+
+### 步骤 13：保存复盘历史
+
+在计算完所有指标（包括连续记录）并加载完任何用于比较的先前历史后，保存一个 JSON 快照：
+
+```bash
+mkdir -p .context/retros
+```
+
+确定今天的下一个序号（将 `$(date +%Y-%m-%d)` 替换为实际日期）：
+```bash
+# 统计今天已有的复盘数量，以获得下一个序号
+today=$(date +%Y-%m-%d)
+existing=$(ls .context/retros/${today}-*.json 2>/dev/null | wc -l | tr -d ' ')
+next=$((existing + 1))
+# 保存为 .context/retros/${today}-${next}.json
+```
+
+使用 Write 工具按以下 schema 保存 JSON 文件：
+```json
+{
+  "date": "2026-03-08",
+  "window": "7d",
+  "metrics": {
+    "commits": 47,
+    "contributors": 3,
+    "prs_merged": 12,
+    "insertions": 3200,
+    "deletions": 800,
+    "net_loc": 2400,
+    "test_loc": 1300,
+    "test_ratio": 0.41,
+    "active_days": 6,
+    "sessions": 14,
+    "deep_sessions": 5,
+    "avg_session_minutes": 42,
+    "loc_per_session_hour": 350,
+    "feat_pct": 0.40,
+    "fix_pct": 0.30,
+    "peak_hour": 22,
+    "ai_assisted_commits": 32
+  },
+  "authors": {
+    "Garry Tan": { "commits": 32, "insertions": 2400, "deletions": 300, "test_ratio": 0.41, "top_area": "browse/" },
+    "Alice": { "commits": 12, "insertions": 800, "deletions": 150, "test_ratio": 0.35, "top_area": "app/services/" }
+  },
+  "version_range": ["1.16.0.0", "1.16.1.0"],
+  "streak_days": 47,
+  "tweetable": "Week of Mar 1: 47 commits (3 contributors), 3.2k LOC, 38% tests, 12 PRs, peak: 10pm",
+  "greptile": {
+    "fixes": 3,
+    "fps": 1,
+    "already_fixed": 2,
+    "signal_pct": 83
+  }
+}
+```
+
+**注意：** 只有当 `~/.gstack/greptile-history.md` 存在并且在时间窗口内有条目时，才包含 `greptile` 字段。只有当 `TODOS.md` 存在时，才包含 `backlog` 字段。只有当找到测试文件（命令 10 返回 > 0）时，才包含 `test_health` 字段。如果任何项没有数据，就完全省略该字段。
+
+当存在测试文件时，在 JSON 中包含测试健康数据：
+```json
+  "test_health": {
+    "total_test_files": 47,
+    "tests_added_this_period": 5,
+    "regression_test_commits": 3,
+    "test_files_changed": 8
+  }
+```
+
+当存在 `TODOS.md` 时，在 JSON 中包含积压项数据：
+```json
+  "backlog": {
+    "total_open": 28,
+    "p0_p1": 2,
+    "p2": 8,
+    "completed_this_period": 3,
+    "added_this_period": 1
+  }
+```
+
+### 步骤 14：撰写叙述
+
+按以下结构输出：
+
+---
+
+**可发推摘要**（第一行，置于所有内容之前）：
+```text
+Week of Mar 1: 47 commits (3 contributors), 3.2k LOC, 38% tests, 12 PRs, peak: 10pm | Streak: 47d
+```
+
+## Engineering Retro: [date range]
+
+### Summary Table
+（来自步骤 2）
+
+### Trends vs Last Retro
+（来自步骤 11，在保存前加载；如果是首次复盘则跳过）
+
+### Time & Session Patterns
+（来自步骤 3-4）
+
+对全团队模式做出解释性叙述：
+- 最高产的时段是什么，以及是什么驱动了这些时段
+- 会话时长是在变长还是变短
+- 每天活跃编码时长的估算（团队汇总）
+- 值得注意的模式：团队成员是在同一时间编码，还是分班进行？
+
+### Shipping Velocity
+（来自步骤 5-7）
+
+叙述应覆盖：
+- 提交类型构成及其反映出的信号
+- PR 大小分布及其对交付节奏的揭示
+- 修复链检测（同一子系统上连续的 fix 提交）
+- 版本升级纪律
+
+### Code Quality Signals
+- 测试 LOC 占比趋势
+- 热点分析（是否总是同一批文件在高频变动？）
+- Greptile 信号比率及趋势（如果存在历史）：`"Greptile: X% signal (Y valid catches, Z false positives)"`
+
+### Test Health
+- 测试文件总数：N（来自命令 10）
+- 本周期新增测试：M（来自命令 12，即变更过的测试文件）
+- 回归测试提交：列出命令 11 中的 `test(qa):`、`test(design):` 和 `test: coverage` 提交
+- 如果存在先前复盘且其中有 `test_health`：显示差值 `"Test count: {last} → {now} (+{delta})"`
+- 如果测试占比 < 20%：标记为成长空间，写明 `"100% test coverage is the goal. Tests make vibe coding safe."`
+
+### Focus & Highlights
+（来自步骤 8）
+- 专注分数及其解读
+- 本周最佳交付提示
+
+### Your Week（个人深挖）
+（来自步骤 9，仅针对当前用户）
+
+这是用户最关心的部分。包括：
+- 个人提交数、LOC、测试占比
+- 个人会话模式和高峰时段
+- 个人关注领域
+- 个人最大交付
+- **What you did well**（2-3 个锚定在提交上的具体点）
+- **Where to level up**（1-2 个具体、可执行的建议）
+
+### Team Breakdown
+（来自步骤 9，针对每位队友；如果是单人仓库则跳过）
+
+对每位队友（按提交数降序排序），写一个部分：
+
+#### [Name]
+- **What they shipped**：用 2-3 句话说明他们的贡献、关注领域和提交模式
+- **Praise**：1-2 个他们做得好的具体点，必须锚定在真实提交上。要真诚，不要空泛。如果是在 1:1 中，你真的会这么说。示例：
+  - `"Cleaned up the entire auth module in 3 small, reviewable PRs — textbook decomposition"`
+  - `"Added integration tests for every new endpoint, not just happy paths"`
+  - `"Fixed the N+1 query that was causing 2s load times on the dashboard"`
+- **Opportunity for growth**：1 个具体、建设性的建议。要表述为投入方向，而不是批评。示例：
+  - `"Test coverage on the payment module is at 8% — worth investing in before the next feature lands on top of it"`
+  - `"Most commits land in a single burst — spacing work across the day could reduce context-switching fatigue"`
+  - `"All commits land between 1-4am — sustainable pace matters for code quality long-term"`
+
+**AI 协作说明：** 如果很多提交带有 `Co-Authored-By` AI trailers（例如 Claude、Copilot），将 AI-assisted commit 占比作为团队指标进行说明。用中性语气表述：`"N% of commits were AI-assisted"`，不要带判断色彩。
+
+### Top 3 Team Wins
+识别整个团队在该时间窗口内交付的 3 个影响最大的成果。对每一个，说明：
+- 它是什么
+- 谁交付的
+- 它为什么重要（产品/架构影响）
+
+### 3 Things to Improve
+具体、可执行，并锚定在真实提交上。混合个人和团队层面的建议。表述方式为：`"to get even better, the team could..."`
+
+### 3 Habits for Next Week
+小而实用，现实可行。每一项都必须是能在 <5 分钟内养成的习惯。至少有一项应当面向团队（例如 `"review each other's PRs same-day"`）。
+
+### Week-over-Week Trends
+（如适用，来自步骤 10）
+
+---
+
+## 全局复盘模式
+
+当用户运行 `/retro global`（或 `/retro global 14d`）时，遵循此流程，而不是仓库范围的步骤 1-14。此模式可在任意目录运行，不要求位于 git 仓库中。
+
+### 全局步骤 1：计算时间窗口
+
+与常规复盘相同，使用按午夜对齐的逻辑。默认 7d。`global` 后面的第二个参数是时间窗口（例如 `14d`、`30d`、`24h`）。
+
+### 全局步骤 2：运行发现流程
+
+使用以下回退链定位并运行发现脚本：
+
+```bash
+DISCOVER_BIN=""
+[ -x ~/.claude/skills/gstack/bin/gstack-global-discover ] && DISCOVER_BIN=~/.claude/skills/gstack/bin/gstack-global-discover
+[ -z "$DISCOVER_BIN" ] && [ -x .claude/skills/gstack/bin/gstack-global-discover ] && DISCOVER_BIN=.claude/skills/gstack/bin/gstack-global-discover
+[ -z "$DISCOVER_BIN" ] && which gstack-global-discover >/dev/null 2>&1 && DISCOVER_BIN=$(which gstack-global-discover)
+[ -z "$DISCOVER_BIN" ] && [ -f bin/gstack-global-discover.ts ] && DISCOVER_BIN="bun run bin/gstack-global-discover.ts"
+echo "DISCOVER_BIN: $DISCOVER_BIN"
+```
+
+如果未找到可执行文件，则告诉用户：`"Discovery script not found. Run \`bun run build\` in the gstack directory to compile it."`，然后停止。
+
+运行发现流程：
+```bash
+$DISCOVER_BIN --since "<window>" --format json 2>/tmp/gstack-discover-stderr
+```
+
+从 `/tmp/gstack-discover-stderr` 读取 stderr 输出以获取诊断信息。解析 stdout 中的 JSON 输出。
+
+如果 `total_sessions` 为 0，则说明：`"No AI coding sessions found in the last <window>. Try a longer window: \`/retro global 30d\`"`，然后停止。
+
+### 全局步骤 3：对每个已发现仓库运行 git log
+
+对于发现 JSON 中 `repos` 数组里的每个仓库，在 `paths[]` 中找到第一个有效路径（目录存在且包含 `.git/`）。如果没有有效路径，则跳过该仓库并记录说明。
+
+**对于仅本地仓库**（`remote` 以 `local:` 开头）：跳过 `git fetch`，并使用本地默认分支。使用 `git log HEAD` 而不是 `git log origin/$DEFAULT`。
+
+**对于带远程仓库的仓库：**
+
+```bash
+git -C <path> fetch origin --quiet 2>/dev/null
+```
+
+为每个仓库检测默认分支：先尝试 `git symbolic-ref refs/remotes/origin/HEAD`，然后检查常见分支名（`main`、`master`），最后回退到 `git rev-parse --abbrev-ref HEAD`。在下面的命令中使用检测到的分支作为 `<default>`。
+
+```bash
+# 带统计信息的提交
+git -C <path> log origin/$DEFAULT --since="<start_date>T00:00:00" --format="%H|%aN|%ai|%s" --shortstat
+
+# 用于检测会话、连续记录和上下文切换的提交时间戳
+git -C <path> log origin/$DEFAULT --since="<start_date>T00:00:00" --format="%at|%aN|%ai|%s" | sort -n
+
+# 按作者统计提交数量
+git -C <path> shortlog origin/$DEFAULT --since="<start_date>T00:00:00" -sn --no-merges
+
+# 从提交信息中提取 PR 编号
+git -C <path> log origin/$DEFAULT --since="<start_date>T00:00:00" --format="%s" | grep -oE '#[0-9]+' | sort -n | uniq
+```
+
+对于失败的仓库（路径已删除、网络错误）：跳过，并记录 `"N repos could not be reached."`
+
+### 全局步骤 4：计算全局交付连续记录
+
+对于每个仓库，获取提交日期（上限 365 天）：
+
+```bash
+git -C <path> log origin/$DEFAULT --since="365 days ago" --format="%ad" --date=format:"%Y-%m-%d" | sort -u
+```
+
+将所有仓库的日期取并集。从今天开始向后倒数，有多少连续天至少有一次提交到任意仓库？如果连续记录达到 365 天上限，则显示为 `"365+ days"`。
+
+### 全局步骤 5：计算上下文切换指标
+
+根据步骤 3 中收集的提交时间戳，按日期分组。对每个日期，统计当天有提交的不同仓库数量。报告：
+- 平均仓库数/天
+- 最大仓库数/天
+- 哪些天是聚焦型（1 个仓库），哪些天是碎片化型（3+ 个仓库）
+
+### 全局步骤 6：按工具分析生产力模式
+
+根据发现 JSON，分析工具使用模式：
+- 哪种 AI 工具用于哪些仓库（独占还是共享）
+- 每种工具的会话数
+- 行为模式（例如，`"Codex used exclusively for myapp, Claude Code for everything else"`）
+
+### 全局步骤 7：汇总并生成叙述
+
+输出结构应先给出**可分享的个人卡片**，再在下方给出完整的
+团队/项目拆分。个人卡片专为截图分享而设计，
+应将一个人想发到 X/Twitter 的内容集中在一个整洁的区块中。
+
+---
+
+**可发推摘要**（第一行，置于所有内容之前）：
+```text
+Week of Mar 14: 5 projects, 138 commits, 250k LOC across 5 repos | 48 AI sessions | Streak: 52d 🔥
+```
+
+## 🚀 Your Week: [user name] — [date range]
+
+这一部分是**可分享的个人卡片**。它只包含当前用户的
+统计数据，不包含团队数据，也不包含项目拆分。专为截图发布而设计。
+
+使用 `git config user.name` 中的用户身份来筛选所有按仓库划分的 git 数据。
+跨所有仓库聚合，计算个人总量。
+
+将其渲染为一个视觉上整洁的单一区块。只保留左边框，不要右边框（LLM
+无法可靠地对齐右边框）。将仓库名补齐到最长名称的长度，以便列整齐对齐。
+绝不要截断项目名称。
+
+```text
+╔═══════════════════════════════════════════════════════════════
+║  [USER NAME] — Week of [date]
+╠═══════════════════════════════════════════════════════════════
+║
+║  [N] commits across [M] projects
+║  +[X]k LOC added · [Y]k LOC deleted · [Z]k net
+║  [N] AI coding sessions (CC: X, Codex: Y, Gemini: Z)
+║  [N]-day shipping streak 🔥
+║
+║  PROJECTS
+║  ─────────────────────────────────────────────────────────
+║  [repo_name_full]        [N] commits    +[X]k LOC    [solo/team]
+║  [repo_name_full]        [N] commits    +[X]k LOC    [solo/team]
+║  [repo_name_full]        [N] commits    +[X]k LOC    [solo/team]
+║
+║  SHIP OF THE WEEK
+║  [PR title] — [LOC] lines across [N] files
+║
+║  TOP WORK
+║  • [1-line description of biggest theme]
+║  • [1-line description of second theme]
+║  • [1-line description of third theme]
+║
+║  Powered by gstack · github.com/garrytan/gstack
+╚═══════════════════════════════════════════════════════════════
+```
+
+**个人卡片规则：**
+- 只显示用户有提交的仓库。提交数为 0 的仓库跳过。
+- 按用户提交数降序排列仓库。
+- **绝不要截断仓库名。** 使用完整仓库名（例如 `analyze_transcripts`
+  而不是 `analyze_trans`）。将名称列补齐到最长仓库名，使所有列
+  整齐对齐。如果名称较长，就加宽盒子，盒子宽度应随内容自适应。
+- 对 LOC，使用 “k” 格式表示千位（例如 `"+64.0k"` 而不是 `"+64010"`）。
+- 角色：如果用户是唯一贡献者，则为 `"solo"`；如果还有其他贡献者，则为 `"team"`。
+- Ship of the Week：用户在**所有**仓库中的单个最高 LOC PR。
+- Top Work：3 个要点，总结用户的主要主题，从
+  提交信息中推断。不是单个提交，而是归纳成主题。
+  例如，写 `"Built /retro global — cross-project retrospective with AI session discovery"`
+  而不是 `"feat: gstack-global-discover"` + `"feat: /retro global template"`。
+- 卡片必须自成一体。即使别人**只看到这个区块**，也应能理解
+  用户这一周做了什么，而不需要任何上下文。
+- 此处**不要**包含团队成员、项目总量或上下文切换数据。
+
+**个人连续记录：** 使用用户跨所有仓库的个人提交（通过
+`--author` 过滤）来计算个人连续记录，与团队连续记录分开。
+
+---
+
+## Global Engineering Retro: [date range]
+
+下面的内容是完整分析，包括团队数据、项目拆分和模式。
+这是接在可分享卡片之后的“深度解析”。
+
+### All Projects Overview
+| Metric | Value |
+|--------|-------|
+| Projects active | N |
+| Total commits (all repos, all contributors) | N |
+| Total LOC | +N / -N |
+| AI coding sessions | N (CC: X, Codex: Y, Gemini: Z) |
+| Active days | N |
+| Global shipping streak (any contributor, any repo) | N consecutive days |
+| Context switches/day | N avg (max: M) |
+
+### Per-Project Breakdown
+对每个仓库（按提交数降序排序）：
+- 仓库名（附总提交数占比）
+- 提交数、LOC、已合并 PR 数、头号贡献者
+- 关键工作（从提交信息推断）
+- 按工具划分的 AI 会话
+
+**Your Contributions**（每个项目内的子部分）：
+对每个项目，添加一个 “Your contributions” 区块，显示当前用户
+在该仓库中的个人统计数据。使用 `git config user.name` 中的用户身份
+进行筛选。包括：
+- 你的提交数 / 总提交数（含占比）
+- 你的 LOC（+insertions / -deletions）
+- 你的关键工作（仅从**你的**提交信息中推断）
+- 你的提交类型构成（feat/fix/refactor/chore/docs 拆分）
+- 你在该仓库中的最大交付（LOC 最高的提交或 PR）
+
+如果用户是唯一贡献者，则说明 `"Solo project — all commits are yours."`
+如果用户在某仓库中提交数为 0（本周期未参与的团队项目），
+则说明 `"No commits this period — [N] AI sessions only."` 并跳过该拆分。
+
+格式：
+```text
+**Your contributions:** 47/244 commits (19%), +4.2k/-0.3k LOC
+  Key work: Writer Chat, email blocking, security hardening
+  Biggest ship: PR #605 — Writer Chat eats the admin bar (2,457 ins, 46 files)
+  Mix: feat(3) fix(2) chore(1)
+```
+
+### Cross-Project Patterns
+- 各项目时间分配（百分比分解，使用**你的**提交而不是总提交）
+- 跨所有仓库聚合后的高峰生产时段
+- 聚焦型天数 vs. 碎片化天数
+- 上下文切换趋势
+
+### Tool Usage Analysis
+按工具拆分，并总结行为模式：
+- Claude Code: N sessions across M repos — observed patterns
+- Codex: N sessions across M repos — observed patterns
+- Gemini: N sessions across M repos — observed patterns
+
+### Ship of the Week (Global)
+跨**所有**项目影响最大的 PR。根据 LOC 和提交信息识别。
+
+### 3 Cross-Project Insights
+全局视角揭示了哪些单仓库复盘无法发现的内容。
+
+### 3 Habits for Next Week
+基于完整的跨项目视角提出建议。
+
+---
+
+### 全局步骤 8：加载历史并比较
+
+```bash
+ls -t ~/.gstack/retros/global-*.json 2>/dev/null | head -5
+```
+
+**只与 `window` 值相同的先前复盘进行比较**（例如 7d 对 7d）。如果最近的一次先前复盘使用的是不同窗口，则跳过比较，并说明：`"Prior global retro used a different window — skipping comparison."`
+
+如果存在匹配的先前复盘，则使用 Read 工具加载它。显示一个 **Trends vs Last Global Retro** 表格，展示关键指标的差值：总提交数、LOC、会话数、连续记录、上下文切换/天。
+
+如果不存在先前的全局复盘，则追加：`"First global retro recorded — run again next week to see trends."`
+
+### 全局步骤 9：保存快照
+
+```bash
+mkdir -p ~/.gstack/retros
+```
+
+确定今天的下一个序号：
+```bash
+today=$(date +%Y-%m-%d)
+existing=$(ls ~/.gstack/retros/global-${today}-*.json 2>/dev/null | wc -l | tr -d ' ')
+next=$((existing + 1))
+```
+
+使用 Write 工具将 JSON 保存到 `~/.gstack/retros/global-${today}-${next}.json`：
+
+```json
+{
+  "type": "global",
+  "date": "2026-03-21",
+  "window": "7d",
+  "projects": [
+    {
+      "name": "gstack",
+      "remote": "https://github.com/garrytan/gstack",
+      "commits": 47,
+      "insertions": 3200,
+      "deletions": 800,
+      "sessions": { "claude_code": 15, "codex": 3, "gemini": 0 }
+    }
+  ],
+  "totals": {
+    "commits": 182,
+    "insertions": 15300,
+    "deletions": 4200,
+    "projects": 5,
+    "active_days": 6,
+    "sessions": { "claude_code": 48, "codex": 8, "gemini": 3 },
+    "global_streak_days": 52,
+    "avg_context_switches_per_day": 2.1
+  },
+  "tweetable": "Week of Mar 14: 5 projects, 182 commits, 15.3k LOC | CC: 48, Codex: 8, Gemini: 3 | Focus: gstack (58%) | Streak: 52d"
+}
+```
+
+---
+
+## 比较模式
+
+当用户运行 `/retro compare`（或 `/retro compare 14d`）时：
+
+1. 使用按午夜对齐的开始日期计算当前时间窗口的指标（默认 7d，逻辑与主复盘相同，例如如果今天是 2026-03-18 且窗口是 7d，则使用 `--since="2026-03-11T00:00:00"`）
+2. 使用 `--since` 和 `--until` 并配合按午夜对齐的日期，计算紧邻的前一个同长度时间窗口，以避免重叠（例如，对于从 2026-03-11 开始的 7d 窗口，前一个窗口是 `--since="2026-03-04T00:00:00" --until="2026-03-11T00:00:00"`）
+3. 展示并排比较表，包含差值和箭头
+4. 写一段简短叙述，突出最大的改进和回退
+5. 只将当前窗口的快照保存到 `.context/retros/`（与普通复盘运行相同）；**不要**持久化前一窗口的指标。
+
+## 语气
+
+- 鼓励但坦率，不要过度安抚
+- 具体且明确，始终锚定在真实提交/代码上
+- 跳过泛泛的表扬（“great job!”），要准确说出哪里做得好以及为什么
+- 将改进表述为升级进阶，而不是批评
+- **Praise 应该像你在 1:1 里真的会说的话**，要具体、配得上、真诚
+- **成长建议应像投资建议**，表达成 “这值得你投入时间，因为……” 而不是 “你哪里做错了……”
+- 不要把队友之间作负面对比。每个人的部分都应独立成立。
+- 总输出控制在约 3000-4500 词（为容纳团队部分，可以略长一些）
+- 数据使用 markdown 表格和代码块，叙述使用 prose
+- 直接输出到对话中，不要写入文件系统（除了 `.context/retros/` JSON 快照）
+
+## 重要规则
+
+- 所有叙述性输出都直接面向用户写在对话中。唯一写入的文件只有 `.context/retros/` JSON 快照。
+- 所有 git 查询都使用 `origin/<default>`（不要使用可能已过时的本地 main）
+- 所有时间戳都按用户本地时区显示（不要覆盖 `TZ`）
+- 如果窗口内没有任何提交，直接说明，并建议使用其他时间窗口
+- LOC/hour 四舍五入到最接近的 50
+- 将 merge commit 视为 PR 边界
+- 不要读取 CLAUDE.md 或其他文档，此技能是自包含的
+- 首次运行时（没有先前复盘），优雅地跳过比较部分
+- **全局模式：** 不要求位于 git 仓库中。快照保存到 `~/.gstack/retros/`（不是 `.context/retros/`）。优雅地跳过未安装的 AI 工具。只与使用相同窗口值的先前全局复盘比较。如果连续记录达到 365d 上限，则显示为 `"365+ days"`。

@@ -1,0 +1,413 @@
+---
+name: autoplan
+version: 1.0.0
+description: |
+  自动审查流水线——从磁盘读取完整的 CEO、design 和 eng 审查技能文件，
+  并使用 6 条决策原则自动做出决策，按顺序依次运行。会在最终批准关卡中呈现
+  品味类决策（接近的方案、边界范围、codex 分歧）。
+  一条命令，输出完整审查后的计划。
+  当被要求“自动审查”、“autoplan”、“运行所有审查”、“自动审查这个计划”
+  或“替我做决定”时使用。
+  当用户有计划文件，并且希望在不回答 15-30 个中间问题的情况下运行完整审查流程时，
+  主动建议使用。
+benefits-from: [office-hours]
+allowed-tools:
+  - Bash
+  - Read
+  - Write
+  - Edit
+  - Glob
+  - Grep
+  - WebSearch
+  - AskUserQuestion
+---
+
+{{PREAMBLE}}
+
+{{BASE_BRANCH_DETECT}}
+
+{{BENEFITS_FROM}}
+
+# /autoplan — 自动审查流水线
+
+一条命令。输入粗略计划，输出完整审查后的计划。
+
+`/autoplan` 会从磁盘读取完整的 CEO、design 和 eng 审查技能文件，并完整遵循
+其中内容——与手动逐个运行每个技能相比，严谨程度、章节结构和方法论都完全一致。
+唯一的区别是：中间的 AskUserQuestion 调用会使用下面的 6 条原则自动决定。
+品味类决策（即理性的人可能存在分歧的地方）会在最终批准关卡中呈现。
+
+---
+
+## 6 条决策原则
+
+这些规则会自动回答所有中间问题：
+
+1. **选择完整性** —— 一次性交付完整内容。选择能覆盖更多边界情况的方案。
+2. **彻底解决** —— 修复所有影响半径内的问题（本计划修改的文件 + 直接导入它们的文件）。自动批准位于影响半径内且 CC 工作量 < 1 天（< 5 个文件，无新增基础设施）的扩展。
+3. **务实** —— 如果两个选项解决的是同一个问题，选择更干净的那个。用 5 秒做选择，而不是 5 分钟。
+4. **DRY** —— 如果重复已有功能，则拒绝。复用现有内容。
+5. **明确胜过巧妙** —— 10 行显而易见的修复优于 200 行抽象。选择新贡献者用 30 秒就能读懂的方案。
+6. **倾向行动** —— Merge 优于反复审查，反复审查优于停滞不前的讨论。标记问题，但不要阻塞。
+
+**冲突解决（依赖上下文的决胜规则）：**
+- **CEO 阶段：** P1（完整性）+ P2（彻底解决）优先。
+- **Eng 阶段：** P5（明确）+ P3（务实）优先。
+- **Design 阶段：** P5（明确）+ P1（完整性）优先。
+
+---
+
+## 决策分类
+
+每个自动决策都会被分类：
+
+**机械型** —— 只有一个明显正确的答案。静默自动决策。
+示例：运行 codex（始终是）、运行 evals（始终是）、缩减一个完整计划的范围（始终否）。
+
+**品味型** —— 理性的人可能存在分歧。会自动给出建议，但会在最终关卡中呈现。通常有三种来源：
+1. **接近的方案** —— 前两个方案都可行，但权衡不同。
+2. **边界范围** —— 位于影响半径内，但涉及 3-5 个文件，或影响半径不明确。
+3. **Codex 分歧** —— codex 给出不同建议，而且理由成立。
+
+---
+
+## “自动决策”是什么意思
+
+自动决策是用这 6 条原则替代 USER 的判断。它**不会**替代
+ANALYSIS。已加载技能文件中的每个章节仍然必须以与交互版相同的深度执行。
+唯一改变的是 AskUserQuestion 由谁来回答：由你根据这 6 条原则回答，
+而不是由用户回答。
+
+**你仍然必须：**
+- READ 每个章节引用的实际代码、diff 和文件
+- PRODUCE 该章节要求的所有输出（图、表、登记表、工件）
+- IDENTIFY 该章节旨在捕获的所有问题
+- DECIDE 每个问题，依据这 6 条原则（而不是询问用户）
+- LOG 每个决策到审计轨迹中
+- WRITE 所有必需的工件到磁盘
+
+**你不得：**
+- 把一个审查章节压缩成表格中的一行
+- 在不展示你检查了什么的情况下写“未发现问题”
+- 因为“这不适用”而跳过某个章节，却不说明你检查了什么以及为什么
+- 用总结代替要求的输出（例如写“架构看起来不错”，而不是该章节要求的 ASCII 依赖图）
+
+“未发现问题”可以作为一个章节的有效输出——但前提是已经完成分析。
+说明你检查了什么，以及为什么没有标记任何内容（至少 1-2 句话）。
+对于未列入跳过清单的章节，“已跳过”永远不是有效输出。
+
+---
+
+## 阶段 0：接收 + 恢复点
+
+### 步骤 1：记录恢复点
+
+在执行任何操作之前，将计划文件的当前状态保存到外部文件：
+
+```bash
+source <(~/.claude/skills/gstack/bin/gstack-slug 2>/dev/null) && mkdir -p ~/.gstack/projects/$SLUG
+BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null | tr '/' '-')
+DATETIME=$(date +%Y%m%d-%H%M%S)
+echo "RESTORE_PATH=$HOME/.gstack/projects/$SLUG/${BRANCH}-autoplan-restore-${DATETIME}.md"
+```
+
+将计划文件的完整内容写入恢复路径，并带上以下头部：
+```
+# /autoplan 恢复点
+记录时间：[timestamp] | 分支：[branch] | 提交：[short hash]
+
+## 重新运行说明
+1. 将下面的“原始计划状态”复制回你的计划文件
+2. 调用 /autoplan
+
+## 原始计划状态
+[计划文件逐字内容]
+```
+
+然后在计划文件最前面加上一行 HTML 注释：
+`<!-- /autoplan 恢复点：[RESTORE_PATH] -->`
+
+### 步骤 2：读取上下文
+
+- 读取 CLAUDE.md、TODOS.md、git log -30、相对 base branch 的 git diff --stat
+- 发现 design 文档：`ls -t ~/.gstack/projects/$SLUG/*-design-*.md 2>/dev/null | head -1`
+- 检测 UI 范围：在计划中 grep 视图/渲染相关术语（component、screen、form、
+  button、modal、layout、dashboard、sidebar、nav、dialog）。要求匹配 2 次以上。排除
+  误报（单独出现的 “page”，或出现在缩写中的 “UI”）。
+
+### 步骤 3：从磁盘加载技能文件
+
+使用 Read 工具读取每个文件：
+- `~/.claude/skills/gstack/plan-ceo-review/SKILL.md`
+- `~/.claude/skills/gstack/plan-design-review/SKILL.md`（仅在检测到 UI 范围时）
+- `~/.claude/skills/gstack/plan-eng-review/SKILL.md`
+
+**章节跳过清单——在遵循已加载的技能文件时，跳过这些章节
+（它们已经由 /autoplan 处理）：**
+- Preamble（最先运行）
+- AskUserQuestion Format
+- Completeness Principle — Boil the Lake
+- Search Before Building
+- Contributor Mode
+- Completion Status Protocol
+- Telemetry（最后运行）
+- Step 0: Detect base branch
+- Review Readiness Dashboard
+- Plan File Review Report
+- Prerequisite Skill Offer (BENEFITS_FROM)
+
+只遵循审查专用的方法、章节和要求的输出。
+
+输出：`Here's what I'm working with: [plan summary]. UI scope: [yes/no].
+Loaded review skills from disk. Starting full review pipeline with auto-decisions.`
+
+---
+
+## 阶段 1：CEO 审查（策略与范围）
+
+遵循 `plan-ceo-review/SKILL.md` —— 所有章节，完整深度执行。
+覆盖规则：每个 AskUserQuestion → 使用 6 条原则自动决策。
+
+**覆盖规则：**
+- 模式选择：SELECTIVE EXPANSION
+- 前提：接受合理的前提（P6），只质疑明显错误的前提
+- **GATE: Present premises to user for confirmation** —— 这是唯一一个**不**自动决策的 AskUserQuestion。
+  前提需要人工判断。
+- 备选方案：选择完整性最高的（P1）。如果打平，选择最简单的（P5）。
+  如果前 2 个方案非常接近 → 标记为 TASTE DECISION。
+- 范围扩展：位于影响半径内且 <1d CC → 批准（P2）。超出范围 → 延后到 TODOS.md（P3）。
+  重复内容 → 拒绝（P4）。边界情况（3-5 个文件）→ 标记为 TASTE DECISION。
+- 全部 10 个审查章节：完整运行，自动决定每个问题，记录每个决策。
+
+**必需执行清单（CEO）：**
+
+步骤 0（0A-0F）——运行每个子步骤并产出：
+- 0A：前提质疑，明确点名前提并进行评估
+- 0B：现有代码利用图（子问题 → 现有代码）
+- 0C：理想终局图（CURRENT → THIS PLAN → 12-MONTH IDEAL）
+- 0C-bis：实现备选方案表（2-3 种方案，包含工作量/风险/优点/缺点）
+- 0D：特定模式分析，并记录范围决策
+- 0E：时间维度追问（HOUR 1 → HOUR 6+）
+- 0F：模式选择确认
+
+章节 1-10 —— 对于**每一个**章节，运行已加载技能文件中的评估标准：
+- 有发现的章节：完整分析，自动决定每个问题，记录到审计轨迹
+- 无发现的章节：用 1-2 句话说明检查了什么，以及为什么
+  没有标记任何内容。绝不要把一个章节压缩成表格中的名称一行。
+- 第 11 节（Design）：仅在阶段 0 检测到 UI 范围时运行
+
+**阶段 1 的强制输出：**
+- “NOT in scope” 章节，包含延后事项及理由
+- “What already exists” 章节，将子问题映射到现有代码
+- Error & Rescue Registry 表（来自第 2 节）
+- Failure Modes Registry 表（来自审查章节）
+- 理想终局差距（本计划与 12 个月理想状态之间的差距）
+- Completion Summary（CEO 技能中的完整汇总表）
+
+---
+
+## 阶段 2：Design 审查（有条件——如果没有 UI 范围则跳过）
+
+遵循 `plan-design-review/SKILL.md` —— 全部 7 个维度，完整深度执行。
+覆盖规则：每个 AskUserQuestion → 使用 6 条原则自动决策。
+
+**覆盖规则：**
+- 关注范围：所有相关维度（P1）
+- 结构性问题（缺失状态、层级破损）：自动修复（P5）
+- 美学/品味类问题：标记为 TASTE DECISION
+- 设计系统对齐：如果存在 DESIGN.md 且修复方式明显，则自动修复
+
+---
+
+## 阶段 3：Eng 审查 + Codex
+
+遵循 `plan-eng-review/SKILL.md` —— 所有章节，完整深度执行。
+覆盖规则：每个 AskUserQuestion → 使用 6 条原则自动决策。
+
+**覆盖规则：**
+- 范围质疑：绝不缩减（P2）
+- Codex 审查：只要可用就始终运行（P6）
+  命令：`codex exec "Review this plan for architectural issues, missing edge cases, and hidden complexity. Be adversarial. File: <plan_path>" -s read-only --enable web_search_cached`
+  超时：10 分钟，然后继续并写入 “Codex timed out — single-reviewer mode”
+- 架构选择：明确胜过巧妙（P5）。如果 codex 以合理理由提出不同意见 → TASTE DECISION。
+- Evals：始终包含所有相关套件（P1）
+- 测试计划：在 `~/.gstack/projects/$SLUG/{user}-{branch}-test-plan-{datetime}.md` 生成工件
+- TODOS.md：收集阶段 1 中所有延后的范围扩展，并自动写入
+
+**必需执行清单（Eng）：**
+
+1. 步骤 0（范围质疑）：读取计划引用的实际代码。将每个
+   子问题映射到现有代码。执行复杂度检查。产出具体发现。
+
+2. 步骤 0.5（Codex）：如可用则运行。在 CODEX SAYS 标题下呈现完整输出。
+
+3. 第 1 节（架构）：产出 ASCII 依赖图，显示新组件
+   以及它们与现有组件的关系。评估耦合、扩展性和安全性。
+
+4. 第 2 节（代码质量）：识别 DRY 违规、命名问题和复杂度。
+   引用具体文件和模式。自动决定每个发现。
+
+5. **第 3 节（测试审查）——绝不能跳过或压缩。**
+   这一节要求读取实际代码，而不是凭记忆总结。
+   - 读取 diff 或计划影响到的文件
+   - 构建测试图：列出每个新的 UX 流、数据流、代码路径和分支
+   - 对图中的**每一项**：由哪种测试覆盖？是否已有？缺口在哪里？
+   - 对于 LLM/prompt 变更：必须运行哪些 eval 套件？
+   - 自动决定测试缺口的含义是：识别缺口 → 决定是添加测试
+     还是延后（附理由和原则）→ 记录决策。**不**意味着
+     跳过分析。
+   - 将测试计划工件写入磁盘
+
+6. 第 4 节（性能）：评估 N+1 查询、内存、缓存和慢路径。
+
+**阶段 3 的强制输出：**
+- “NOT in scope” 章节
+- “What already exists” 章节
+- 架构 ASCII 图（第 1 节）
+- 将代码路径映射到覆盖情况的测试图（第 3 节）
+- 写入磁盘的测试计划工件（第 3 节）
+- 带关键缺口标记的 failure modes registry
+- Completion Summary（Eng 技能中的完整汇总）
+- TODOS.md 更新（汇总自所有阶段）
+
+---
+
+## 决策审计轨迹
+
+每次自动决策后，使用 Edit 向计划文件追加一行：
+
+```markdown
+<!-- AUTONOMOUS DECISION LOG -->
+## Decision Audit Trail
+
+| # | Phase | Decision | Principle | Rationale | Rejected |
+|---|-------|----------|-----------|-----------|----------|
+```
+
+每个决策逐步写入一行（通过 Edit）。这样可以把审计信息保存在磁盘上，
+而不是累积在对话上下文中。
+
+---
+
+## 关卡前校验
+
+在呈现最终批准关卡之前，校验必需输出是否**确实**
+已经产生。检查计划文件和对话中的每一项。
+
+**阶段 1（CEO）输出：**
+- [ ] 前提质疑中明确点名了具体前提（而不只是“前提已接受”）
+- [ ] 所有适用的审查章节都有发现，或明确写明“检查了 X，未标记任何内容”
+- [ ] 已产出 Error & Rescue Registry 表（或注明 N/A 及原因）
+- [ ] 已产出 Failure Modes Registry 表（或注明 N/A 及原因）
+- [ ] 已写入 “NOT in scope” 章节
+- [ ] 已写入 “What already exists” 章节
+- [ ] 已写入理想终局差距
+- [ ] 已产出 Completion Summary
+
+**阶段 2（Design）输出——仅在检测到 UI 范围时：**
+- [ ] 全部 7 个维度都已评分评估
+- [ ] 已识别问题并自动决策
+
+**阶段 3（Eng）输出：**
+- [ ] 范围质疑包含实际代码分析（而不只是“范围没问题”）
+- [ ] 已产出架构 ASCII 图
+- [ ] 已产出将代码路径映射到测试覆盖的测试图
+- [ ] 已将测试计划工件写入 `~/.gstack/projects/$SLUG/`
+- [ ] 已写入 “NOT in scope” 章节
+- [ ] 已写入 “What already exists” 章节
+- [ ] 已产出带关键缺口评估的 failure modes registry
+- [ ] 已产出 Completion Summary
+
+**审计轨迹：**
+- [ ] Decision Audit Trail 至少对每个自动决策都有一行（不能为空）
+
+如果上面任意复选框缺失，返回并补全缺失输出。最多尝试 2 次——如果重试两次后仍然缺失，
+则带警告进入关卡，并注明哪些项目未完成。不要无限循环。
+
+---
+
+## 阶段 4：最终批准关卡
+
+**在这里停止，并向用户呈现最终状态。**
+
+先以消息形式呈现，然后使用 AskUserQuestion：
+
+```
+## /autoplan 审查完成
+
+### 计划摘要
+[1-3 句摘要]
+
+### 已做决策：[N] 总计（[M] 自动决策，[K] 需要你选择）
+
+### 你的选择（品味类决策）
+[对于每个品味类决策：]
+**选择 [N]：[title]**（来自 [phase]）
+我建议 [X] —— [principle]。但 [Y] 也可行：
+  [如果你选择 Y，会产生的下游影响，用 1 句话说明]
+
+### 自动决策：[M] 项 [见计划文件中的 Decision Audit Trail]
+
+### 审查评分
+- CEO: [summary]
+- Design: [summary or "skipped, no UI scope"]
+- Eng: [summary]
+- Codex: [summary or "unavailable"]
+
+### 已延后到 TODOS.md
+[自动延后的项目及原因]
+```
+
+**认知负担管理：**
+- 0 个品味类决策：跳过 “Your Choices” 章节
+- 1-7 个品味类决策：平铺列表
+- 8 个以上：按阶段分组。增加警告：`This plan had unusually high ambiguity ([N] taste decisions). Review carefully.`
+
+AskUserQuestion 选项：
+- A) 按当前内容批准（接受所有建议）
+- B) 带覆盖项批准（指定要更改哪些品味类决策）
+- C) 追问（询问任意具体决策）
+- D) 修订（计划本身需要变更）
+- E) 拒绝（重新开始）
+
+**选项处理：**
+- A: 标记为 APPROVED，写入审查日志，建议使用 /ship
+- B: 询问哪些覆盖项，应用后重新呈现关卡
+- C: 自由形式回答，然后重新呈现关卡
+- D: 做出更改，重新运行受影响阶段（scope→1B，design→2，test plan→3，arch→3）。最多 3 个循环。
+- E: 重新开始
+
+---
+
+## 完成：写入审查日志
+
+批准后，分别写入 3 条独立的审查日志记录，以便 /ship 的仪表盘能够识别：
+
+```bash
+COMMIT=$(git rev-parse --short HEAD 2>/dev/null)
+TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+~/.claude/skills/gstack/bin/gstack-review-log '{"skill":"plan-ceo-review","timestamp":"'"$TIMESTAMP"'","status":"clean","unresolved":0,"critical_gaps":0,"mode":"SELECTIVE_EXPANSION","via":"autoplan","commit":"'"$COMMIT"'"}'
+
+~/.claude/skills/gstack/bin/gstack-review-log '{"skill":"plan-eng-review","timestamp":"'"$TIMESTAMP"'","status":"clean","unresolved":0,"critical_gaps":0,"issues_found":0,"mode":"FULL_REVIEW","via":"autoplan","commit":"'"$COMMIT"'"}'
+```
+
+如果阶段 2 已运行（UI 范围）：
+```bash
+~/.claude/skills/gstack/bin/gstack-review-log '{"skill":"plan-design-review","timestamp":"'"$TIMESTAMP"'","status":"clean","unresolved":0,"via":"autoplan","commit":"'"$COMMIT"'"}'
+```
+
+将字段值替换为审查中的实际统计数。
+
+建议下一步：准备创建 PR 时使用 `/ship`。
+
+---
+
+## 重要规则
+
+- **绝不终止。** 用户选择了 /autoplan。尊重这个选择。呈现所有品味类决策，绝不要重定向到交互式审查。
+- **前提是唯一关卡。** 唯一一个不自动决策的 AskUserQuestion，是阶段 1 中对前提的确认。
+- **记录每个决策。** 不允许静默自动决策。每个选择都必须在审计轨迹中有一行。
+- **完整深度就意味着完整深度。** 不要压缩或跳过已加载技能文件中的章节（阶段 0 中的跳过清单除外）。“完整深度”的含义是：读取该章节要求你读取的代码，产出该章节要求的输出，识别每个问题，并对每个问题做出决策。用一句话总结一个章节并不叫“完整深度”——那是跳过。如果你发现自己为任何审查章节写的内容少于 3 句话，你很可能是在压缩。
+- **工件就是交付物。** 测试计划工件、failure modes registry、error/rescue 表、ASCII 图——这些内容在审查完成时必须存在于磁盘上或计划文件中。如果不存在，则审查不完整。
+- **顺序执行。** CEO → Design → Eng。每个阶段都建立在前一个阶段之上。
